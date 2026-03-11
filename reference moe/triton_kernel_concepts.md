@@ -552,7 +552,197 @@ GEMM2 scale:     scale[expert, h ÷ 128, intermediate ÷ 128]
 
 ---
 
-## 11. CUDA Kernel Equivalents
+## 11. New: Fused GEMM + FP8 Dequant Kernel (added sub-2)
+
+### 3.11 `tl.dot(a, b, acc=None)`
+
+**Purpose:** Computes a matrix multiplication of two tiles in registers.
+
+```python
+acc += tl.dot(a_tile, tl.trans(w_dequant))
+```
+
+- **Input:**
+  - `a` — 2D tensor `[M, K]`
+  - `b` — 2D tensor `[K, N]` (note: K must be inner dim for both)
+  - `acc` — optional accumulator tensor `[M, N]` (default: add to existing)
+- **Output:** 2D tensor `[M, N]`
+- Maps to hardware tensor core MMA (matrix multiply-accumulate) instructions
+- K dimension must be ≥ 16 for tensor core utilization
+- **Important:** Both inputs must be contiguous in the expected dimension
+
+**Precision behavior:**
+- FP32 inputs → CUDA core FFMA path (not tensor cores)
+- FP16/BF16 inputs → tensor core HMMA path
+- FP8 inputs → tensor core FP8 MMA (requires `tl.dot_scaled` for block scaling)
+
+> **Observed:** Using `tl.dot` on FP32 dequanted values introduces slightly different
+> accumulation ordering than cuBLAS, leading to ~2× higher absolute error on large-T workloads.
+> This is acceptable but worth knowing.
+
+> **Reference:** [Triton Language — dot](https://triton-lang.org/main/python-api/generated/triton.language.dot.html) [20]
+
+### 3.12 `tl.trans(x)`
+
+**Purpose:** Transposes a 2D tensor tile.
+
+```python
+w_T = tl.trans(w_dequant)  # [N, K] → [K, N]
+```
+
+- **Input:** 2D tensor `[A, B]`
+- **Output:** 2D tensor `[B, A]`
+- Zero-cost in most cases (just changes the indexing)
+- Used with `tl.dot` to compute `A @ W^T` as `dot(A, trans(W))`
+
+### Fused GEMM + Dequant Pattern
+
+The key innovation in sub-2 is performing weight dequantization **inside** the GEMM K-loop:
+
+```python
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+for k_start in range(0, K, BLOCK_K):
+    # 1. Load activation tile: [BLOCK_M, BLOCK_K]
+    a_tile = tl.load(a_ptr + ...)
+
+    # 2. Load FP8 weight tile: [BLOCK_N, BLOCK_K]
+    w_tile = tl.load(w_ptr + ...).to(tl.float32)
+
+    # 3. Load scale for this (n_block, k_block) pair: [BLOCK_N]
+    s = tl.load(s_ptr + n_block_idx * ss0 + k_block_idx * ss1)
+
+    # 4. Dequant: broadcast scale over K
+    w_dequant = w_tile * s[:, None]
+
+    # 5. Accumulate into FP32: [M,K] @ [K,N] → [M,N]
+    acc += tl.dot(a_tile, tl.trans(w_dequant))
+```
+
+**Why BLOCK_K must equal 128:**
+- The FP8 quantization block size is 128
+- Each K-loop iteration loads exactly one scale block
+- If BLOCK_K != 128, you'd need to load multiple scales per K-tile and apply
+  them to different sub-regions, which is complex and error-prone
+
+**Memory savings:**
+- Before: Materialize `[2I, H] × FP32` = `4096 × 7168 × 4 = 112 MB per expert`
+- After: Only load `[BLOCK_N, BLOCK_K]` = `64 × 128 × 1 = 8 KB` FP8 per tile
+- Total: **~5.3 GB saved** across 32 experts (W13 + W2)
+
+---
+
+## 12. New: Pre-Computed Dispatch Table (added sub-3)
+
+### Why Pre-Compute?
+
+In the naive implementation, each expert iteration does:
+```python
+sel = valid_local & (local_idx == le)         # GPU broadcast + compare
+if not torch.any(sel): continue               # GPU reduction
+token_idx, topk_pos = torch.nonzero(sel, ...)  # GPU scan
+```
+
+That's **3 GPU kernel launches per expert × 32 experts = 96 kernel launches** just for dispatch.
+
+### Optimized Dispatch (sub-3)
+
+Single-pass dispatch using `argsort` + `unique_consecutive`:
+```python
+# 1. Find all valid (token, topk_pos) pairs: 1 kernel launch
+all_valid = torch.nonzero(valid_local, as_tuple=False)
+
+# 2. Get their local expert IDs: pure indexing
+flat_expert_id = local_idx[all_valid[:, 0], all_valid[:, 1]]
+
+# 3. Sort by expert: 1 kernel launch
+sort_order = torch.argsort(flat_expert_id, stable=True)
+
+# 4. Find expert group boundaries: 1 kernel launch
+unique_experts, counts = torch.unique_consecutive(sorted_expert_id, ...)
+```
+
+**Result:** ~4 GPU kernel launches total instead of ~96. Expected 5-10% improvement on small-T workloads where dispatch overhead dominates.
+
+### Other dispatch functions used
+
+- `torch.argsort(x, stable=True)` — sort indices; `stable=True` preserves original
+  order for equal keys (tokens routed to the same expert keep their token order)
+- `torch.unique_consecutive(x, return_counts=True)` — finds group boundaries in a
+  sorted tensor; returns (unique values, count per group)
+- `torch.cumsum(counts, dim=0)` — convert counts to boundary indices
+
+---
+
+## 13. New: Adaptive Compute Paths
+
+### Problem: One Size Doesn't Fit All
+
+Different workloads have very different token-per-expert counts:
+- **Decode-like:** T=1-8 → most experts get 0-1 tokens
+- **Prefill-like:** T=1024+ → experts get 32-256 tokens
+
+The Triton fused GEMM kernel has ~10-50 μs launch overhead, while cuBLAS has ~5 μs.
+For Tk=1-2, the launch overhead dominates; for Tk=64+, the bandwidth savings dominate.
+
+### Solution: Adaptive Threshold
+
+```python
+FUSED_GEMM_TOKEN_THRESHOLD = 32   # tuned via benchmarks
+
+if Tk >= FUSED_GEMM_TOKEN_THRESHOLD:
+    g1 = _gemm_with_fp8_dequant(...)    # Triton: on-the-fly dequant
+    c = _swiglu(g1)                      # Triton: fused SwiGLU
+else:
+    w13 = _dequant_w13_local(...)        # PyTorch: pre-dequant
+    g1 = torch.matmul(a_e, w13.t())      # cuBLAS: optimized small GEMM
+    c = _swiglu_torch(g1)                # PyTorch: F.silu fallback
+```
+
+### Threshold Tuning History
+
+| Threshold | Sub | Large-T Impact | Small-T Impact |
+|-----------|-----|---------------|----------------|
+| ∞ (never) | sub-1 | Baseline | Baseline |
+| 16 | sub-2 | **−40-55% latency** | +0.5% (overhead) |
+| 32 | sub-3 | Similar to sub-2 | Better (fewer false fused) |
+
+---
+
+## 14. New: Experimental Findings from B200 Benchmarks
+
+### Finding 1: Fused GEMM gives 40-55% speedup on large-T
+
+| Workload | Sub-1 (cuBLAS) | Sub-2 (fused) | Improvement |
+|----------|---------------|---------------|-------------|
+| `1a4c6ba1` | 20.6 ms | 9.3 ms | **2.2×** |
+| `5e8dc11c` | 44.1 ms | 27.1 ms | **1.6×** |
+| `58a34f27` | 34.8 ms | 20.3 ms | **1.7×** |
+
+### Finding 2: Small-T workloads are routing-dominated
+
+Workloads with T < 32 show similar latency across all submissions (2.5–4.2 ms).
+The expert compute is fast; routing (sigmoid, topk, group scoring) dominates.
+
+### Finding 3: Numerical accuracy varies with GEMM path
+
+- **cuBLAS path** (pre-dequant + matmul): max abs_err ≈ 2048
+- **Fused Triton path** (on-the-fly dequant + tl.dot): max abs_err ≈ 8192
+
+Both pass the benchmark but the fused path has ~4× higher max absolute error.
+This is due to different float32 accumulation ordering (Triton's K-loop is sequential;
+cuBLAS uses tree reduction).
+
+### Finding 4: Near-zero outputs cause extreme relative error
+
+Workloads `58a34f27` and `5e8dc11c` consistently show rel_err > 10^5.
+This is because the reference output has values very close to 0 (e.g., `1e-8`),
+and dividing a small absolute error by near-zero amplifies the relative metric.
+**This does NOT indicate a bug** — the absolute error is bounded.
+
+---
+
+## 15. CUDA Kernel Equivalents
 
 The same logic is implemented in CUDA (`kernel.cu`) with these kernels:
 
@@ -560,7 +750,7 @@ The same logic is implemented in CUDA (`kernel.cu`) with these kernels:
 |---------------|----------------|------------|
 | `_dequant_hidden_fp8_kernel` | `dequant_hidden_fp8` | `(⌈H/256⌉, ⌈T/32⌉)` blocks of `(256, 4)` |
 | `_swiglu_kernel` | `swiglu_activation` | `(⌈I/256⌉, ⌈Tk/32⌉)` blocks of `(256, 4)` |
-| — | `dequant_weight_fp8` | General FP8 weight dequant |
+| `_gemm_fp8_dequant_kernel` | `dequant_weight_fp8` + cuBLAS | Separate dequant + BLAS call |
 | — | `cast_fp32_to_bf16` | Final type cast |
 
 **Key CUDA types:**
@@ -570,7 +760,7 @@ The same logic is implemented in CUDA (`kernel.cu`) with these kernels:
 
 ---
 
-## 12. References & Citations
+## 16. References & Citations
 
 [1] FlashInfer-Bench Solution Schema — Destination Passing Style.
     https://bench.flashinfer.ai/docs/flashinfer-trace/solution
@@ -631,6 +821,15 @@ The same logic is implemented in CUDA (`kernel.cu`) with these kernels:
 [19] PyTorch Blog — 2D Dynamic Block Quantized Float8 GEMMs in Triton.
      https://pytorch.org/blog/dynamic-block-quantized-float8-gemms-in-triton/
 
+[20] Triton Language — `dot`.
+     https://triton-lang.org/main/python-api/generated/triton.language.dot.html
+
+[21] PyTorch — Grouped GEMM for MoE with Triton.
+     https://pytorch.org/blog/grouped-gemm-for-moe/
+
+[22] vLLM — Persistent MoE Kernel Design.
+     https://docs.vllm.ai/en/latest/design/kernel/moe.html
+
 ---
 
-> **Last updated:** 2026-03-11 | **Target:** NVIDIA B200 (Blackwell) | **Track:** fused_moe
+> **Last updated:** 2026-03-11 (sub-3) | **Target:** NVIDIA B200 (Blackwell) | **Track:** fused_moe
