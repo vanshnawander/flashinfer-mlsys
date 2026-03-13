@@ -28,7 +28,7 @@ Sub-10 = Sub-9 precision + maximum throughput
        to the output accumulator, eliminating o_buf entirely.
        Saves max_tk × 7168 × 4 bytes of scratch memory.
 
-    7. num_stages=4 for GEMM2 (K=2048 → only 16 iters, deeper pipe helps)
+    7. num_stages=3 for both kernels (balanced for B200 shared memory)
 
   PRECISION:
     - Identical to Sub-9: FP8→BF16 lossless, scales in FP32 post-dot
@@ -123,7 +123,7 @@ def _fused_gemm1_swiglu_kernel(
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
-        k_blk = k_start // BLOCK_K
+        k_blk = k_start // 128  # Fix: Must divide by quantization block size (128), not BLOCK_K. BK=64 means 2 BK tiles per scale tile.
 
         # ── Load A tile: FP8 → BF16 (lossless) ──
         a_tile = tl.load(
@@ -131,21 +131,21 @@ def _fused_gemm1_swiglu_kernel(
             mask=mask_m[:, None] & mask_k[None, :], other=0.0
         ).to(tl.bfloat16)
 
-        # ── Load W_gate in (K, N) order for tl.dot — NO tl.trans needed ──
-        w_gate_t = tl.load(
-            w_ptr + offs_k[:, None] * sw1 + offs_n[None, :] * sw0,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0
+        # ── Load W_gate in (BLOCK_N, BLOCK_K) order for contiguous load ──
+        w_gate = tl.load(
+            w_ptr + offs_n[:, None] * sw0 + offs_k[None, :] * sw1,
+            mask=mask_n[:, None] & mask_k[None, :], other=0.0
         ).to(tl.bfloat16)
 
-        # ── Load W_up in (K, N) order ──
-        w_up_t = tl.load(
-            w_ptr + offs_k[:, None] * sw1 + (offs_n[None, :] + N_HALF) * sw0,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0
+        # ── Load W_up in (BLOCK_N, BLOCK_K) order ──
+        w_up = tl.load(
+            w_ptr + (offs_n[:, None] + N_HALF) * sw0 + offs_k[None, :] * sw1,
+            mask=mask_n[:, None] & mask_k[None, :], other=0.0
         ).to(tl.bfloat16)
 
-        # ── BF16 tensor core dot (no transpose!) ──
-        raw_gate = tl.dot(a_tile, w_gate_t)    # (BLOCK_M, BLOCK_N) FP32
-        raw_up = tl.dot(a_tile, w_up_t)        # (BLOCK_M, BLOCK_N) FP32
+        # ── BF16 tensor core dot using tl.trans ──
+        raw_gate = tl.dot(a_tile, tl.trans(w_gate))    # (BLOCK_M, BLOCK_N) FP32
+        raw_up = tl.dot(a_tile, tl.trans(w_up))        # (BLOCK_M, BLOCK_N) FP32
 
         # ── Scales in FP32 post-dot (zero precision loss) ──
         a_s = tl.load(
@@ -228,7 +228,7 @@ def _gemm2_scatter_kernel(
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
-        k_block_idx = k_start // BLOCK_K
+        k_block_idx = k_start // 128  # Fix: Must divide by quantization block size (128), not BLOCK_K. BK=64 means 2 BK tiles per scale tile.
 
         # C input (FP32, SwiGLU output)
         c_tile = tl.load(
@@ -236,20 +236,20 @@ def _gemm2_scatter_kernel(
             mask=mask_m[:, None] & mask_k[None, :], other=0.0
         )  # (BLOCK_M, BLOCK_K) FP32
 
-        # W2 in (K, N) transposed order — no tl.trans needed
-        w_t = tl.load(
-            w_ptr + offs_k[:, None] * sw1 + offs_n[None, :] * sw0,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0
-        ).to(tl.float32)  # (BLOCK_K, BLOCK_N)
+        # W2 in (BLOCK_N, BLOCK_K) contiguous order
+        w = tl.load(
+            w_ptr + offs_n[:, None] * sw0 + offs_k[None, :] * sw1,
+            mask=mask_n[:, None] & mask_k[None, :], other=0.0
+        ).to(tl.float32)  # (BLOCK_N, BLOCK_K)
 
         # Scale (scalar: BLOCK_N=128=BLOCK_Q, BLOCK_K=128=BLOCK_Q)
         s_val = tl.load(s_ptr + n_block_idx * ss0 + k_block_idx * ss1).to(tl.float32)
 
         # Dequant weight in FP32
-        w_dq = w_t * s_val  # (BLOCK_K, BLOCK_N)
+        w_dq = w * s_val  # (BLOCK_N, BLOCK_K)
 
-        # TF32 tensor core dot: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) → FP32
-        acc += tl.dot(c_tile, w_dq)
+        # TF32 tensor core dot
+        acc += tl.dot(c_tile, tl.trans(w_dq))
 
     # ── Fused epilogue: multiply by routing weight ──
     route_w = tl.load(route_w_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
@@ -266,7 +266,7 @@ def _gemm2_scatter_kernel(
 
 # ═══════════════════════════ Python Launchers ═════════════════════════════════ #
 def _launch_fused_gemm1_swiglu(a_fp8, a_scale, w_fp8, w_scale, Tk, c_out):
-    BM, BN, BK = 64, 128, 128
+    BM, BN, BK = 32, 128, 64
     grid_size = triton.cdiv(Tk, BM) * triton.cdiv(INTERMEDIATE_SIZE, BN)
     _fused_gemm1_swiglu_kernel[(grid_size,)](
         a_fp8, a_scale, w_fp8, w_scale, c_out,
@@ -284,7 +284,7 @@ def _launch_fused_gemm1_swiglu(a_fp8, a_scale, w_fp8, w_scale, Tk, c_out):
 
 
 def _launch_gemm2_scatter(c_e, w_fp8, w_scale, route_w, token_map, Tk, accum):
-    BM, BN, BK = 64, 128, 128
+    BM, BN, BK = 64, 128, 64
     grid_size = triton.cdiv(Tk, BM) * triton.cdiv(HIDDEN_SIZE, BN)
     T_orig = accum.shape[0]
     _gemm2_scatter_kernel[(grid_size,)](
@@ -298,7 +298,7 @@ def _launch_gemm2_scatter(c_e, w_fp8, w_scale, route_w, token_map, Tk, accum):
         accum.stride(0), accum.stride(1),
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
         GROUP_SIZE_M=8,
-        num_stages=4, num_warps=4,
+        num_stages=3, num_warps=4,
     )
 
 
