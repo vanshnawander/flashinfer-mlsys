@@ -297,91 +297,173 @@ def kernel(
     routed_scaling_factor: float,
     output: torch.Tensor,
 ):
+    print("=== KERNEL START ===")
+    print(f"Input routing_logits shape: {routing_logits.shape}, dtype: {routing_logits.dtype}")
+    print(f"Input routing_bias shape: {routing_bias.shape}, dtype: {routing_bias.dtype}")
+    print(f"Input hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+    print(f"Input hidden_states_scale shape: {hidden_states_scale.shape}, dtype: {hidden_states_scale.dtype}")
+    print(f"Input gemm1_weights shape: {gemm1_weights.shape}, dtype: {gemm1_weights.dtype}")
+    print(f"Input gemm1_weights_scale shape: {gemm1_weights_scale.shape}, dtype: {gemm1_weights_scale.dtype}")
+    print(f"Input gemm2_weights shape: {gemm2_weights.shape}, dtype: {gemm2_weights.dtype}")
+    print(f"Input gemm2_weights_scale shape: {gemm2_weights_scale.shape}, dtype: {gemm2_weights_scale.dtype}")
+    print(f"local_expert_offset: {local_expert_offset}")
+    print(f"routed_scaling_factor: {routed_scaling_factor}")
+    print(f"Output shape: {output.shape}, dtype: {output.dtype}")
+
     t_size = routing_logits.shape[0]
     local_start = int(local_expert_offset)
     device = hidden_states.device
 
-    # Simple routing
+    print(f"\n1. Basic setup:")
+    print(f"   t_size (sequence length): {t_size}")
+    print(f"   local_start (expert offset): {local_start}")
+    print(f"   device: {device}")
+
+    print("# 2. Routing computation:")
     logits = routing_logits.to(torch.float32)
+    print(f"   logits converted to FP32, shape: {logits.shape}")
+
     bias = routing_bias.to(torch.float32).view(-1)
+    print(f"   bias converted to FP32 and reshaped, shape: {bias.shape}")
+
     s = torch.sigmoid(logits)
+    print(f"   sigmoid applied, s shape: {s.shape}, range: [{s.min():.4f}, {s.max():.4f}]")
+
     s_with_bias = s + bias
+    print(f"   bias added, s_with_bias shape: {s_with_bias.shape}, range: [{s_with_bias.min():.4f}, {s_with_bias.max():.4f}]")
 
+    print("# 3. Group-based routing:")
     s_wb_grouped = s_with_bias.view(t_size, N_GROUP, GROUP_SIZE)
-    top2_vals = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False).values
-    group_scores = top2_vals.sum(dim=2)
+    print(f"   s_with_bias grouped into {N_GROUP} groups of {GROUP_SIZE} experts each")
+    print(f"   s_wb_grouped shape: {s_wb_grouped.shape}")
 
+    top2_vals = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False).values
+    print(f"   top-2 values per group extracted, shape: {top2_vals.shape}")
+
+    group_scores = top2_vals.sum(dim=2)
+    print(f"   group scores computed (sum of top-2), shape: {group_scores.shape}")
+    print(f"   group_scores range: [{group_scores.min():.4f}, {group_scores.max():.4f}]")
+
+    print("# 4. Group selection:")
     group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False).indices
+    print(f"   selected top-{TOPK_GROUP} groups, indices: {group_idx}")
+
     group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
     group_mask.scatter_(1, group_idx, True)
+    print(f"   group mask created, shape: {group_mask.shape}")
 
     score_mask = group_mask.unsqueeze(2).expand(t_size, N_GROUP, GROUP_SIZE).reshape(t_size, NUM_EXPERTS)
+    print(f"   score mask expanded to expert level, shape: {score_mask.shape}")
+
     scores_pruned = s_with_bias.masked_fill(~score_mask, float("-inf"))
+    print(f"   scores pruned (non-selected experts set to -inf)")
+
     topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False).indices
+    print(f"   top-{TOP_K} experts selected globally, shape: {topk_idx.shape}")
+    print(f"   selected expert indices: {topk_idx}")
 
+    print("# 5. Weight computation:")
     topk_s = torch.gather(s, 1, topk_idx)
-    topk_w = (topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20)) * float(routed_scaling_factor)
+    print(f"   top-k sigmoid values gathered, shape: {topk_s.shape}")
 
+    topk_w = (topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20)) * float(routed_scaling_factor)
+    print(f"   routing weights normalized and scaled, shape: {topk_w.shape}")
+    print(f"   routing weights range: [{topk_w.min():.4f}, {topk_w.max():.4f}]")
+
+    print("# 6. Local expert filtering:")
     local_idx = topk_idx - local_start
+    print(f"   expert indices shifted by local_start ({local_start}), shape: {local_idx.shape}")
+
     valid_local = (local_idx >= 0) & (local_idx < NUM_LOCAL_EXPERTS)
+    print(f"   valid local experts mask created, shape: {valid_local.shape}")
+    print(f"   valid selections per token: {valid_local.sum(dim=1)}")
+
     accum = torch.zeros((t_size, HIDDEN_SIZE), dtype=torch.float32, device=device)
+    print(f"   output accumulator initialized, shape: {accum.shape}")
 
     all_valid_idx = torch.nonzero(valid_local, as_tuple=False)
+    print(f"   all valid (token, topk_pos) pairs found: {all_valid_idx.shape}")
+
     if all_valid_idx.numel() == 0:
+        print("   No valid local experts found - returning zero output")
         output.copy_(accum.to(torch.bfloat16))
         return
 
+    print("# 7. Expert processing setup:")
     flat_token_idx = all_valid_idx[:, 0]
     flat_topk_pos = all_valid_idx[:, 1]
     flat_expert_id = local_idx[flat_token_idx, flat_topk_pos]
 
+    print(f"   flat_token_idx: {flat_token_idx}")
+    print(f"   flat_topk_pos: {flat_topk_pos}")
+    print(f"   flat_expert_id: {flat_expert_id}")
+
     sort_order = torch.argsort(flat_expert_id, stable=True)
+    print(f"   sort order for expert grouping: {sort_order}")
+
     sorted_expert_id = flat_expert_id[sort_order]
     sorted_token_idx = flat_token_idx[sort_order]
     sorted_topk_pos = flat_topk_pos[sort_order]
 
+    print(f"   sorted_expert_id: {sorted_expert_id}")
+    print(f"   sorted_token_idx: {sorted_token_idx}")
+    print(f"   sorted_topk_pos: {sorted_topk_pos}")
+
     unique_experts, counts = torch.unique_consecutive(sorted_expert_id, return_counts=True)
     boundaries = torch.cumsum(counts, dim=0)
 
-    # Bulk gather if enough tokens
-    N_valid = sorted_token_idx.numel()
-    use_bulk = (N_valid >= 64)
-    if use_bulk:
-        sorted_a_fp8 = hidden_states.index_select(0, sorted_token_idx)
-        sorted_a_scale = hidden_states_scale.index_select(1, sorted_token_idx)
-        sorted_w = topk_w[sorted_token_idx, sorted_topk_pos].to(torch.float32)
+    print(f"   unique experts to process: {unique_experts}")
+    print(f"   token counts per expert: {counts}")
+    print(f"   expert boundaries: {boundaries}")
 
-    a_fp32_cache = None
-    c_buf = torch.empty((int(counts.max()), INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
-
+    print("# 8. Processing experts:")
     start = 0
     for i in range(unique_experts.numel()):
         le = unique_experts[i].item()
         end = boundaries[i].item()
         Tk = end - start
         t_idx = sorted_token_idx[start:end]
-        w_e = sorted_w[start:end] if use_bulk else topk_w[t_idx, sorted_topk_pos[start:end]].to(torch.float32)
+        w_e = topk_w[t_idx, sorted_topk_pos[start:end]].to(torch.float32)
 
-        if Tk >= FUSED_GEMM_THRESHOLD:
-            if use_bulk:
-                a_e_fp8 = sorted_a_fp8[start:end]
-                a_e_scale = sorted_a_scale[:, start:end].contiguous()
-            else:
-                a_e_fp8 = hidden_states.index_select(0, t_idx)
-                a_e_scale = hidden_states_scale.index_select(1, t_idx).contiguous()
+        print(f"\n   Expert {le} (local expert {i}):")
+        print(f"     token count: {Tk}")
+        print(f"     token indices: {t_idx}")
+        print(f"     routing weights: {w_e}")
 
-            c_view = c_buf[:Tk]
-            _launch_fused_gemm1_swiglu(a_e_fp8, a_e_scale, gemm1_weights[le], gemm1_weights_scale[le], Tk, c_view)
-            _launch_gemm2_scatter(c_view, gemm2_weights[le], gemm2_weights_scale[le], w_e, t_idx, Tk, accum)
-        else:
-            if a_fp32_cache is None:
-                a_fp32_cache = _dequant_hidden_fp32(hidden_states, hidden_states_scale)
-            a_e = a_fp32_cache.index_select(0, t_idx)
+        if Tk > 0:
+            print(f"     Dequantizing GEMM1 weights for expert {le}...")
             w13_e = _dequant_weight(gemm1_weights[le], gemm1_weights_scale[le], 2*INTERMEDIATE_SIZE, HIDDEN_SIZE)
-            c_result = _swiglu_torch(torch.matmul(a_e, w13_e.t()))
+            print(f"       GEMM1 weights shape: {w13_e.shape}")
+
+            print(f"     Dequantizing GEMM2 weights for expert {le}...")
             w2_e = _dequant_weight(gemm2_weights[le], gemm2_weights_scale[le], HIDDEN_SIZE, INTERMEDIATE_SIZE)
-            accum.index_add_(0, t_idx, torch.matmul(c_result, w2_e.t()) * w_e.unsqueeze(1))
+            print(f"       GEMM2 weights shape: {w2_e.shape}")
+
+            print(f"     Dequantizing input tokens...")
+            a_e = _dequant_hidden_fp32(hidden_states.index_select(0, t_idx), hidden_states_scale.index_select(1, t_idx).contiguous())
+            print(f"       Input tokens shape: {a_e.shape}")
+
+            print(f"     GEMM1: {a_e.shape} @ {w13_e.t().shape} = {(a_e @ w13_e.t()).shape}")
+            g1 = torch.matmul(a_e, w13_e.t())
+            print(f"       GEMM1 result range: [{g1.min():.4f}, {g1.max():.4f}]")
+
+            print(f"     SwiGLU activation...")
+            c_result = _swiglu_torch(g1)
+            print(f"       SwiGLU result shape: {c_result.shape}, range: [{c_result.min():.4f}, {c_result.max():.4f}]")
+
+            print(f"     GEMM2: {c_result.shape} @ {w2_e.t().shape} = {(c_result @ w2_e.t()).shape}")
+            o = torch.matmul(c_result, w2_e.t())
+            print(f"       GEMM2 result shape: {o.shape}, range: [{o.min():.4f}, {o.max():.4f}]")
+
+            print(f"     Accumulating with routing weights...")
+            weighted_output = o * w_e.unsqueeze(1)
+            accum.index_add_(0, t_idx, weighted_output)
+            print(f"       Accumulation completed for expert {le}")
 
         start = end
 
+    print("# 9. Final output:")
     output.copy_(accum.to(torch.bfloat16))
+    print(f"   Output copied to BF16, final shape: {output.shape}")
+    print(f"   Output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
+    print("=== KERNEL END ===")
