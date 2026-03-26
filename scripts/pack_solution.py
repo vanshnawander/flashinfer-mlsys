@@ -53,10 +53,12 @@ def pack_solution(output_path: Path = None) -> Path:
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
     # Create build spec
+    binding = "torch" if language == "cuda" else None
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        binding=binding,
     )
 
     # Pack the solution

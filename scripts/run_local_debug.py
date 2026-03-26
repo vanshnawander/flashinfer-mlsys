@@ -1,110 +1,63 @@
 #!/usr/bin/env python3
-"""Debug version of run_local.py that skips reference implementations."""
+"""
+Local debug runner for MoE kernels.
+
+Supports both Triton and CUDA solutions with synthetic or real workload data.
+Usage:
+    python scripts/run_local_debug.py                  # Triton, synthetic, T=64
+    python scripts/run_local_debug.py --cuda            # CUDA binding
+    python scripts/run_local_debug.py --T 4096          # Large T test
+    python scripts/run_local_debug.py --T 7 --verbose   # Debug prints
+"""
 
 import os
-import json
 import sys
+import argparse
+import time
 from pathlib import Path
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
-from safetensors.torch import load_file
-from flashinfer_bench import BenchmarkConfig, Solution
 
 
-def get_trace_set_path() -> str:
-    """Get trace set path from environment variable."""
-    path = os.environ.get("FIB_DATASET_PATH")
-    if not path:
-        raise EnvironmentError(
-            "FIB_DATASET_PATH environment variable not set. "
-            "Please set it to the path of your flashinfer-trace dataset."
-        )
-    return path
+def create_synthetic_tensors(T: int, expert_offset: int = 192, device: str = 'cuda'):
+    """Create synthetic test tensors matching the benchmark format."""
+    H = 7168
+    I = 2048
+    BQ = 128
+    E = 32  # local experts
 
+    # FP8 = torch.float8_e4m3fn if available, else int8 as raw bytes
+    fp8_dtype = getattr(torch, 'float8_e4m3fn', torch.int8)
 
-def load_single_workload(workload_uuid: str, base_dir: str):
-    """Load a single workload's tensors."""
-    jsonl_path = PROJECT_ROOT.parent / "mlsys26-contest/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.jsonl"
+    # Hidden states (FP8)
+    if fp8_dtype == torch.int8:
+        hidden_states = torch.randint(-127, 127, (T, H), dtype=torch.int8, device=device)
+    else:
+        hidden_states = torch.randn(T, H, device=device, dtype=torch.float32).to(fp8_dtype)
 
-    # Find workload config
-    workload_config = None
-    with open(jsonl_path, 'r') as f:
-        for line in f:
-            data = json.loads(line)
-            if data['workload']['uuid'] == workload_uuid:
-                workload_config = data['workload']
-                break
+    hidden_states_scale = torch.rand(H // BQ, T, dtype=torch.float32, device=device) * 0.1 + 0.01
 
-    if not workload_config:
-        raise ValueError(f"Workload {workload_uuid} not found")
+    # Routing
+    routing_logits = torch.randn(T, 256, dtype=torch.float32, device=device)
+    routing_bias = torch.randn(256, dtype=torch.bfloat16, device=device) * 0.01
 
-    seq_len = workload_config['axes']['seq_len']
-    expert_offset = workload_config['inputs']['local_expert_offset']['value']
+    # Weights (FP8)
+    if fp8_dtype == torch.int8:
+        gemm1_weights = torch.randint(-127, 127, (E, 2 * I, H), dtype=torch.int8, device=device)
+        gemm2_weights = torch.randint(-127, 127, (E, H, I), dtype=torch.int8, device=device)
+    else:
+        gemm1_weights = torch.randn(E, 2 * I, H, device=device, dtype=torch.float32).to(fp8_dtype)
+        gemm2_weights = torch.randn(E, H, I, device=device, dtype=torch.float32).to(fp8_dtype)
 
-    # Load tensors
-    logits_file = workload_config['inputs']['routing_logits']['path'].split('/')[-1]
-    bias_file = workload_config['inputs']['routing_bias']['path'].split('/')[-1]
+    gemm1_weights_scale = torch.rand(E, (2 * I) // BQ, H // BQ, dtype=torch.float32, device=device) * 0.1 + 0.01
+    gemm2_weights_scale = torch.rand(E, H // BQ, I // BQ, dtype=torch.float32, device=device) * 0.1 + 0.01
 
-    logits_path = os.path.join(base_dir, logits_file)
-    bias_path = os.path.join(base_dir, bias_file)
-
-    routing_logits = load_file(logits_path)['routing_logits']
-    routing_bias = load_file(bias_path)['routing_bias']
-
-    print(f"Loaded workload {workload_uuid[:8]}:")
-    print(f"  Sequence length: {seq_len}")
-    print(f"  Expert offset: {expert_offset}")
-    print(f"  Routing logits shape: {routing_logits.shape}")
-    print(f"  Routing bias shape: {routing_bias.shape}")
+    output = torch.zeros(T, H, dtype=torch.bfloat16, device=device)
 
     return {
-        'uuid': workload_uuid,
-        'seq_len': seq_len,
-        'expert_offset': expert_offset,
-        'routing_logits': routing_logits,
-        'routing_bias': routing_bias,
-        'logits_file': logits_file,
-        'bias_file': bias_file
-    }
-
-
-def create_minimal_tensors(seq_len: int = 7, expert_offset: int = 192):
-    """Create minimal test tensors for debugging."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Create synthetic routing data
-    num_experts = 256
-    routing_logits = torch.randn(seq_len, num_experts, dtype=torch.float32, device=device)
-    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
-
-    # Create synthetic hidden states (FP8 quantized)
-    hidden_size = 7168
-    block_size = 128
-    hidden_states = torch.randint(-127, 127, (seq_len, hidden_size), dtype=torch.int8, device=device)
-    hidden_states_scale = torch.randn(hidden_size // block_size, seq_len, dtype=torch.float32, device=device)
-
-    # Create synthetic weights (FP8 quantized)
-    intermediate_size = 2048
-    num_local_experts = 32
-
-    gemm1_weights = torch.randint(-127, 127, (num_local_experts, 2 * intermediate_size, hidden_size), dtype=torch.int8, device=device)
-    gemm1_weights_scale = torch.randn(num_local_experts, (2 * intermediate_size) // block_size, hidden_size // block_size, dtype=torch.float32, device=device)
-
-    gemm2_weights = torch.randint(-127, 127, (num_local_experts, hidden_size, intermediate_size), dtype=torch.int8, device=device)
-    gemm2_weights_scale = torch.randn(num_local_experts, hidden_size // block_size, intermediate_size // block_size, dtype=torch.float32, device=device)
-
-    print(f"Created minimal synthetic tensors:")
-    print(f"  Sequence length: {seq_len}")
-    print(f"  Expert offset: {expert_offset}")
-    print(f"  Device: {device}")
-
-    return {
-        'seq_len': seq_len,
-        'expert_offset': expert_offset,
         'routing_logits': routing_logits,
         'routing_bias': routing_bias,
         'hidden_states': hidden_states,
@@ -113,25 +66,20 @@ def create_minimal_tensors(seq_len: int = 7, expert_offset: int = 192):
         'gemm1_weights_scale': gemm1_weights_scale,
         'gemm2_weights': gemm2_weights,
         'gemm2_weights_scale': gemm2_weights_scale,
+        'local_expert_offset': expert_offset,
+        'routed_scaling_factor': 2.5,
+        'output': output,
     }
 
 
-def run_debug_kernel(tensors: dict):
-    """Run the kernel with extensive debugging."""
-    device = tensors['routing_logits'].device
+def run_kernel(kernel_fn, tensors, warmup=3, benchmark_iters=10):
+    """Run kernel with warmup and timing."""
+    device = tensors['output'].device
 
-    # Prepare output tensor
-    output = torch.zeros((tensors['seq_len'], 7168), dtype=torch.bfloat16, device=device)
-
-    print("\n" + "="*60)
-    print("RUNNING DEBUG KERNEL")
-    print("="*60)
-
-    # Import and run the kernel
-    from solution.triton.local_kernel import kernel
-
-    try:
-        kernel(
+    # Warmup
+    for _ in range(warmup):
+        tensors['output'].zero_()
+        kernel_fn(
             routing_logits=tensors['routing_logits'],
             routing_bias=tensors['routing_bias'],
             hidden_states=tensors['hidden_states'],
@@ -140,62 +88,141 @@ def run_debug_kernel(tensors: dict):
             gemm1_weights_scale=tensors['gemm1_weights_scale'],
             gemm2_weights=tensors['gemm2_weights'],
             gemm2_weights_scale=tensors['gemm2_weights_scale'],
-            local_expert_offset=tensors['expert_offset'],
-            routed_scaling_factor=2.5,
-            output=output
+            local_expert_offset=tensors['local_expert_offset'],
+            routed_scaling_factor=tensors['routed_scaling_factor'],
+            output=tensors['output'],
         )
+        torch.cuda.synchronize()
 
-        print("\n✓ Kernel completed successfully!")
-        print(f"Output shape: {output.shape}")
-        print(f"Output dtype: {output.dtype}")
-        print(f"Output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
+    # Benchmark
+    times = []
+    for _ in range(benchmark_iters):
+        tensors['output'].zero_()
+        torch.cuda.synchronize()
 
-    except Exception as e:
-        print(f"\n✗ Kernel failed with error: {e}")
-        import traceback
-        traceback.print_exc()
+        start = time.perf_counter()
+        kernel_fn(
+            routing_logits=tensors['routing_logits'],
+            routing_bias=tensors['routing_bias'],
+            hidden_states=tensors['hidden_states'],
+            hidden_states_scale=tensors['hidden_states_scale'],
+            gemm1_weights=tensors['gemm1_weights'],
+            gemm1_weights_scale=tensors['gemm1_weights_scale'],
+            gemm2_weights=tensors['gemm2_weights'],
+            gemm2_weights_scale=tensors['gemm2_weights_scale'],
+            local_expert_offset=tensors['local_expert_offset'],
+            routed_scaling_factor=tensors['routed_scaling_factor'],
+            output=tensors['output'],
+        )
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+
+        times.append((end - start) * 1000)
+
+    return times
 
 
 def main():
-    """Main debug function."""
-    print("FlashInfer-MoE Local Debug Runner")
-    print("=" * 40)
+    parser = argparse.ArgumentParser(description='Local MoE kernel debug runner')
+    parser.add_argument('--cuda', action='store_true', help='Use CUDA binding instead of Triton')
+    parser.add_argument('--T', type=int, default=64, help='Sequence length (default: 64)')
+    parser.add_argument('--expert-offset', type=int, default=192, help='Expert offset (default: 192)')
+    parser.add_argument('--warmup', type=int, default=3, help='Warmup iterations')
+    parser.add_argument('--iters', type=int, default=10, help='Benchmark iterations')
+    parser.add_argument('--verbose', action='store_true', help='Print debug info')
+    parser.add_argument('--compare', action='store_true', help='Compare Triton vs CUDA')
+    args = parser.parse_args()
 
-    # Set dataset path
-    if 'FIB_DATASET_PATH' not in os.environ:
-        os.environ['FIB_DATASET_PATH'] = '/home/vanshnawander/accelerated-hpc/mlsys26-contest'
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA not available. This script requires a GPU.")
+        sys.exit(1)
 
-    base_dir = '/home/vanshnawander/accelerated-hpc/mlsys26-contest/blob/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048'
+    device = 'cuda'
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print(f"CUDA: {torch.version.cuda}")
+    print(f"PyTorch: {torch.__version__}")
+    print()
 
-    # Choose what to run
-    print("\nChoose debug mode:")
-    print("1. Use synthetic minimal tensors")
-    print("2. Load real workload (specify UUID)")
+    # Create synthetic data
+    print(f"Creating synthetic tensors: T={args.T}, expert_offset={args.expert_offset}")
+    tensors = create_synthetic_tensors(args.T, args.expert_offset, device)
+    print(f"  hidden_states: {tensors['hidden_states'].shape} ({tensors['hidden_states'].dtype})")
+    print(f"  gemm1_weights: {tensors['gemm1_weights'].shape} ({tensors['gemm1_weights'].dtype})")
+    print()
 
-    choice = input("Enter choice (1 or 2): ").strip()
+    if args.compare:
+        # Run both and compare
+        print("=" * 60)
+        print("COMPARING TRITON vs CUDA")
+        print("=" * 60)
 
-    if choice == '1':
-        # Use synthetic tensors
-        seq_len = int(input("Enter sequence length (default 7): ") or "7")
-        expert_offset = int(input("Enter expert offset (default 192): ") or "192")
-        tensors = create_minimal_tensors(seq_len, expert_offset)
+        from solution.triton.kernel import kernel as triton_kernel
+        from solution.cuda.binding import kernel as cuda_kernel
 
-    elif choice == '2':
-        # Load real workload
-        workload_uuid = input("Enter workload UUID (default: b8f4f012-a32e-4356-b4e1-7665b3d598af): ").strip()
-        if not workload_uuid:
-            workload_uuid = "b8f4f012-a32e-4356-b4e1-7665b3d598af"
+        # Triton
+        print("\n--- Triton ---")
+        try:
+            triton_times = run_kernel(triton_kernel, tensors, args.warmup, args.iters)
+            triton_out = tensors['output'].clone()
+            print(f"  Median: {sorted(triton_times)[len(triton_times)//2]:.3f} ms")
+            print(f"  Output range: [{triton_out.float().min():.4f}, {triton_out.float().max():.4f}]")
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            triton_out = None
 
-        workload = load_single_workload(workload_uuid, base_dir)
-        tensors = create_minimal_tensors(workload['seq_len'], workload['expert_offset'])
-        print(f"Using parameters from workload {workload_uuid}")
+        # CUDA
+        print("\n--- CUDA ---")
+        try:
+            cuda_times = run_kernel(cuda_kernel, tensors, args.warmup, args.iters)
+            cuda_out = tensors['output'].clone()
+            print(f"  Median: {sorted(cuda_times)[len(cuda_times)//2]:.3f} ms")
+            print(f"  Output range: [{cuda_out.float().min():.4f}, {cuda_out.float().max():.4f}]")
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            cuda_out = None
+
+        # Compare outputs
+        if triton_out is not None and cuda_out is not None:
+            diff = (triton_out.float() - cuda_out.float()).abs()
+            print(f"\n--- Comparison ---")
+            print(f"  Max abs diff: {diff.max():.6e}")
+            print(f"  Mean abs diff: {diff.mean():.6e}")
 
     else:
-        print("Invalid choice")
-        return
+        # Single kernel run
+        if args.cuda:
+            print("Loading CUDA kernel...")
+            from solution.cuda.binding import kernel as kernel_fn
+            kernel_name = "CUDA"
+        else:
+            print("Loading Triton kernel...")
+            from solution.triton.kernel import kernel as kernel_fn
+            kernel_name = "Triton"
 
-    # Run the debug kernel
-    run_debug_kernel(tensors)
+        print(f"\nRunning {kernel_name} kernel (T={args.T})...")
+        try:
+            times = run_kernel(kernel_fn, tensors, args.warmup, args.iters)
+            out = tensors['output']
+
+            print(f"\n✓ {kernel_name} kernel completed successfully!")
+            print(f"  Output shape: {out.shape}, dtype: {out.dtype}")
+            print(f"  Output range: [{out.float().min():.4f}, {out.float().max():.4f}]")
+            print(f"  Non-zero elements: {(out != 0).sum().item()} / {out.numel()}")
+            print(f"\n  Timing ({args.iters} iters):")
+            print(f"    Min:    {min(times):.3f} ms")
+            print(f"    Median: {sorted(times)[len(times)//2]:.3f} ms")
+            print(f"    Max:    {max(times):.3f} ms")
+
+            if args.verbose:
+                print(f"\n  All times: {[f'{t:.3f}' for t in times]}")
+                print(f"  Output sample (first 5 tokens, first 10 cols):")
+                print(out[:5, :10].float())
+
+        except Exception as e:
+            print(f"\n✗ {kernel_name} kernel FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
 
 if __name__ == "__main__":

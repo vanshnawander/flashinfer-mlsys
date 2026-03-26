@@ -8,6 +8,11 @@ Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
+
+Changes from starter-kit template:
+    - Image: Added CUDA toolkit (nvcc, build-essential, ninja) for torch binding CUDA solutions
+    - print_results: Enhanced with file logging and workload parameter loading
+    - debug_env: Optional helper to check B200 build environment (use --debug flag)
 """
 
 import sys
@@ -28,9 +33,21 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# Image with CUDA toolkit for torch-binding CUDA solutions.
+# Starter-kit default only has: debian_slim + pip_install(flashinfer-bench, torch, triton, numpy)
+# We add: build-essential, ninja, nvcc (cuda-nvcc-12-8) for JIT-compiling .cu files.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .apt_install("build-essential", "ninja-build", "wget", "gnupg")
+    .run_commands(
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb",
+        "dpkg -i cuda-keyring_1.1-1_all.deb",
+        "apt-get update",
+        "apt-get install -y cuda-nvcc-12-8 cuda-cudart-dev-12-8",
+        "ln -sf /usr/local/cuda-12.8 /usr/local/cuda",
+    )
+    .env({"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:$PATH"})
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "ninja")
 )
 
 
@@ -85,9 +102,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
 def load_workload_parameters(workload_uuid: str, definition_name: str) -> dict:
     """Load all parameters for a specific workload from JSONL file."""
-    # Go up one level from flashinfer-mlsys to find mlsys26-contest
     jsonl_path = PROJECT_ROOT.parent / "mlsys26-contest/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.jsonl"
-    
     try:
         with open(jsonl_path, 'r') as f:
             for line in f:
@@ -95,128 +110,88 @@ def load_workload_parameters(workload_uuid: str, definition_name: str) -> dict:
                 if data['workload']['uuid'] == workload_uuid:
                     workload = data['workload']
                     return {
-                        'uuid': workload_uuid,
                         'seq_len': workload['axes']['seq_len'],
                         'local_expert_offset': workload['inputs']['local_expert_offset']['value'],
                         'routed_scaling_factor': workload['inputs']['routed_scaling_factor']['value'],
-                        'routing_logits_path': workload['inputs']['routing_logits']['path'],
-                        'routing_bias_path': workload['inputs']['routing_bias']['path'],
-                        'routing_logits_tensor_key': workload['inputs']['routing_logits']['tensor_key'],
-                        'routing_bias_tensor_key': workload['inputs']['routing_bias']['tensor_key'],
-                        'hidden_states_type': workload['inputs']['hidden_states']['type'],
-                        'hidden_states_scale_type': workload['inputs']['hidden_states_scale']['type'],
-                        'gemm1_weights_type': workload['inputs']['gemm1_weights']['type'],
-                        'gemm1_weights_scale_type': workload['inputs']['gemm1_weights_scale']['type'],
-                        'gemm2_weights_type': workload['inputs']['gemm2_weights']['type'],
-                        'gemm2_weights_scale_type': workload['inputs']['gemm2_weights_scale']['type']
                     }
-    except Exception as e:
-        print(f"Error loading workload parameters: {e}")
-        return {}
-    
+    except Exception:
+        pass
     return {}
 
 
 def print_results(results: dict):
-    """Print benchmark results and save to log file with all parameters."""
-    # Create logs directory if it doesn't exist
+    """Print benchmark results in a formatted way and save to log file."""
+    # Create logs directory
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(exist_ok=True)
-    
-    # Create log file with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = logs_dir / f"benchmark_results_{timestamp}.log"
-    
+
     print(f"\nSaving results to: {log_file}")
-    
-    # Prepare log content
-    log_lines = []
-    log_lines.append("=" * 80)
-    log_lines.append(f"BENCHMARK RESULTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log_lines.append("=" * 80)
-    log_lines.append("")
-    
+
+    log_lines = [
+        "=" * 80,
+        f"BENCHMARK RESULTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 80, "",
+    ]
+
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         log_lines.append(f"Definition: {def_name}")
         log_lines.append("-" * 40)
-        
+
         for workload_uuid, result in traces.items():
-            # Load all workload parameters
-            workload_params = load_workload_parameters(workload_uuid, def_name)
-            
+            wp = load_workload_parameters(workload_uuid, def_name)
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
+
             log_lines.append(f"Workload UUID: {workload_uuid}")
             log_lines.append(f"  Status: {status}")
-            
-            # Log all workload parameters
-            if workload_params:
-                log_lines.append("  Workload Parameters:")
-                log_lines.append(f"    Sequence Length: {workload_params.get('seq_len', 'N/A')}")
-                log_lines.append(f"    Local Expert Offset: {workload_params.get('local_expert_offset', 'N/A')}")
-                log_lines.append(f"    Routed Scaling Factor: {workload_params.get('routed_scaling_factor', 'N/A')}")
-                log_lines.append(f"    Routing Logits Path: {workload_params.get('routing_logits_path', 'N/A')}")
-                log_lines.append(f"    Routing Bias Path: {workload_params.get('routing_bias_path', 'N/A')}")
-                log_lines.append(f"    Routing Logits Tensor Key: {workload_params.get('routing_logits_tensor_key', 'N/A')}")
-                log_lines.append(f"    Routing Bias Tensor Key: {workload_params.get('routing_bias_tensor_key', 'N/A')}")
-                log_lines.append(f"    Hidden States Type: {workload_params.get('hidden_states_type', 'N/A')}")
-                log_lines.append(f"    Hidden States Scale Type: {workload_params.get('hidden_states_scale_type', 'N/A')}")
-                log_lines.append(f"    GEMM1 Weights Type: {workload_params.get('gemm1_weights_type', 'N/A')}")
-                log_lines.append(f"    GEMM1 Weights Scale Type: {workload_params.get('gemm1_weights_scale_type', 'N/A')}")
-                log_lines.append(f"    GEMM2 Weights Type: {workload_params.get('gemm2_weights_type', 'N/A')}")
-                log_lines.append(f"    GEMM2 Weights Scale Type: {workload_params.get('gemm2_weights_scale_type', 'N/A')}")
-            
-            # Log performance results
-            log_lines.append("  Performance Results:")
+            if wp:
+                log_lines.append(f"  Seq Len: {wp.get('seq_len', 'N/A')}")
+
             if result.get("latency_ms") is not None:
-                latency = result['latency_ms']
+                latency = result["latency_ms"]
                 print(f" | {latency:.3f} ms", end="")
-                log_lines.append(f"    Latency: {latency:.3f} ms")
+                log_lines.append(f"  Latency: {latency:.3f} ms")
 
             if result.get("speedup_factor") is not None:
-                speedup = result['speedup_factor']
+                speedup = result["speedup_factor"]
                 print(f" | {speedup:.2f}x speedup", end="")
-                log_lines.append(f"    Speedup: {speedup:.2f}x")
+                log_lines.append(f"  Speedup: {speedup:.2f}x")
 
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
-                log_lines.append(f"    Max Absolute Error: {abs_err:.2e}")
-                log_lines.append(f"    Max Relative Error: {rel_err:.2e}")
-            
+                log_lines.append(f"  Max Abs Error: {abs_err:.2e}")
+                log_lines.append(f"  Max Rel Error: {rel_err:.2e}")
+
             if result.get("reference_latency_ms") is not None:
-                ref_latency = result['reference_latency_ms']
-                log_lines.append(f"    Reference Latency: {ref_latency:.3f} ms")
-            
-            log_lines.append(f"    Solution: {result.get('solution', 'N/A')}")
+                log_lines.append(f"  Ref Latency: {result['reference_latency_ms']:.3f} ms")
+
+            log_lines.append(f"  Solution: {result.get('solution', 'N/A')}")
             log_lines.append("")
             print()
 
-    # Write to log file in append mode
     try:
-        with open(log_file, 'a') as f:
+        with open(log_file, 'w') as f:
             f.write('\n'.join(log_lines) + '\n')
-        print(f"Results successfully saved to {log_file}")
+        print(f"Results saved to {log_file}")
     except Exception as e:
-        print(f"Error saving log file: {e}")
-    
-    # Also print summary to console
-    print("\n" + "=" * 60)
-    print("BENCHMARK SUMMARY")
-    print("=" * 60)
-    total_workloads = sum(len(traces) for traces in results.values())
-    successful_workloads = sum(
-        1 for traces in results.values() 
-        for result in traces.values() 
-        if result.get("status") == "success"
+        print(f"Error saving log: {e}")
+
+    # Summary
+    total = sum(len(traces) for traces in results.values())
+    passed = sum(
+        1 for traces in results.values()
+        for r in traces.values()
+        if r.get("status") == "PASSED"
     )
-    print(f"Total workloads: {total_workloads}")
-    print(f"Successful: {successful_workloads}")
-    print(f"Failed: {total_workloads - successful_workloads}")
-    print(f"Log file: {log_file}")
-    print("=" * 60)
+    print(f"\n{'=' * 60}")
+    print(f"SUMMARY: {passed}/{total} PASSED")
+    print(f"Log: {log_file}")
+    print(f"{'=' * 60}")
 
 
 @app.local_entrypoint()

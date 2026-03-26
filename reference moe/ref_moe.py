@@ -44,9 +44,9 @@ def run(
     assert E_local == 32, "num_local_experts must be 32"
 
     # Routing constants
-    TOP_K = 8
-    N_GROUP = 8
-    TOPK_GROUP = 4
+    TOP_K = 8 # number of experts to route to per token
+    N_GROUP = 8 # number of groups for group-wise top-k
+    TOPK_GROUP = 4 # number of groups to keep based on group scores
 
     # Block counts
     num_hidden_blocks = H // BLOCK          # 56

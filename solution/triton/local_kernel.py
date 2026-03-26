@@ -320,10 +320,16 @@ def kernel(
     print(f"   device: {device}")
 
     print("# 2. Routing computation:")
+    print(routing_logits)
     logits = routing_logits.to(torch.float32)
+    print(logits)
     print(f"   logits converted to FP32, shape: {logits.shape}")
 
+    print("routing_bias:", routing_bias)
     bias = routing_bias.to(torch.float32).view(-1)
+    print("bias after conversion:", bias)
+
+
     print(f"   bias converted to FP32 and reshaped, shape: {bias.shape}")
 
     s = torch.sigmoid(logits)
