@@ -1,40 +1,36 @@
 """
-Triton optimized MoE kernel — Submission 9
+Triton optimized MoE kernel — Submission 12
 moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-Sub-9 = BF16 tensor cores + factored block-scale application
+Sub-9-opt = Sub-9 (proven correct) + route-weight fusion only
 
-  MATHEMATICAL INSIGHT:
-    FP8 E4M3 has 4 significant bits. BF16 has 8. FP8→BF16 is LOSSLESS.
-    Instead of dequant(FP8→FP32) then truncate(FP32→BF16) which LOSES
-    scale precision, we keep FP8 raw values, promote to BF16 losslessly,
-    do BF16 dot (tensor cores), then apply scales in FP32 post-dot.
+  FIX: Reverted c_buf to FP32. BF16 SwiGLU output caused numerical error
+  because SwiGLU produces full-range FP32 values — BF16 truncation is lossy.
+  The "only 16 K-tiles" argument was wrong: 2048 correlated truncation errors
+  compound beyond tolerance.
 
-  RESULT:
-    - BF16 tensor core speed (~2× TFLOPS vs TF32)
-    - ZERO precision loss (mathematically equivalent to FP32 path)
-    - 4× less gather bandwidth (FP8 vs FP32 tokens)
-    - Eliminates separate dequant kernel entirely
+  RULE: BF16 is ONLY safe for data originating from FP8 (4→8 bits, lossless).
+        Any FP32-computed value (SwiGLU, dequanted activations × scales)
+        MUST stay FP32 until final output conversion.
 
-  ARCHITECTURE (per expert):
-    GEMM1+SwiGLU fused kernel:
-      For each (m_tile, n_tile) and each k_block:
-        raw_dot_gate = dot_bf16(a_fp8_as_bf16, w_gate_fp8_as_bf16)  -- BF16 TC
-        raw_dot_up   = dot_bf16(a_fp8_as_bf16, w_up_fp8_as_bf16)    -- BF16 TC
-        gate_acc += raw_dot_gate * a_scale[m, k_blk] * w_scale[n_blk, k_blk]  -- FP32
-        up_acc   += raw_dot_up   * a_scale[m, k_blk] * w_scale[n_up_blk, k_blk]  -- FP32
-      SwiGLU: store gate_acc * silu(up_acc)
+  SAFE OPTIMIZATIONS KEPT:
+    1. BF16 tensor cores for GEMM1 (factored post-dot scales)        ← FP8→BF16 lossless
+    2. Fused GEMM1+SwiGLU (single kernel, shared A loads)            ← no precision change
+    3. Fused route-weight multiply in GEMM2 epilogue                  ← in-register FP32, free
+    4. FP8 bulk gather (4× less bandwidth than FP32)                  ← no precision change
+    5. Coalesced loads + tl.trans() (proven on B200)                   ← no precision change
 
-    GEMM2 kernel:
-      Input c is FP32 from SwiGLU. INTER=2048 is small (K dim).
-      We keep c in FP32, dequant w2 to FP32, use FP32 dot (TF32 TC).
-      (BF16 trick doesn't apply here: c is FP32, not from FP8)
+  PRECISION CHAIN:
+    FP8 → BF16 (lossless) → GEMM1 BF16 TC → FP32 acc × FP32 scales
+    → FP32 SwiGLU → FP32 store → FP32 GEMM2 (TF32 TC) → FP32 acc
+    → × FP32 route_w (fused) → FP32 scatter → BF16 output
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ALL intermediate buffers FP32
 """
 
 import torch
 import triton
 import triton.language as tl
-
 
 # ═══════════════════════════ Geometry Constants ══════════════════════════════ #
 HIDDEN_SIZE = 7168
@@ -45,51 +41,36 @@ BLOCK_Q = 128
 TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
-GROUP_SIZE = NUM_EXPERTS // N_GROUP   # 32
+GROUP_SIZE = NUM_EXPERTS // N_GROUP
 
 FUSED_GEMM_THRESHOLD = 32
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
-#  Fused GEMM1 + SwiGLU with factored block-scale BF16 dot                     #
-#                                                                               #
-#  For each tile (m_block, n_block) over K-blocks:                              #
-#    1. Load a_fp8 tile → promote to BF16 (LOSSLESS: 4 bits → 8 bits)          #
-#    2. Load w_gate_fp8 and w_up_fp8 → promote to BF16 (LOSSLESS)              #
-#    3. BF16 × BF16 dot → raw_dot in FP32 (uses BF16 tensor cores)             #
-#    4. Load a_scale (per-token, per-K-block) and w_scale (per-N-block, K-blk)  #
-#    5. acc += raw_dot * a_scale[:, None] * w_scale (FP32 multiply)             #
-#    6. After all K-blocks: SwiGLU epilogue in FP32                             #
-#                                                                               #
-#  This avoids ALL precision-losing truncation while using BF16 tensor cores.   #
+#  FUSED GEMM1 + SwiGLU                                                        #
+#  BF16 tensor cores, factored post-dot scales, FP32 output                    #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
 @triton.jit
-def _fused_gemm1_swiglu_bf16_kernel(
-    # A (hidden states): FP8, shape (M, K) where K=HIDDEN_SIZE
-    a_ptr,
-    # A scales: FP32, shape (num_h_blocks, M) = (K//128, M)
-    # Indexed as: a_scale[k_block, m] with strides (sas0, sas1)
-    a_scale_ptr,
-    # W (gemm1 weight): FP8, shape (2*N_HALF, K) where N_HALF=INTERMEDIATE_SIZE
-    # Rows 0:N_HALF = gate, rows N_HALF:2*N_HALF = up
-    w_ptr,
-    # W scales: FP32, shape (2*N_HALF//128, K//128) = (32, 56)
-    w_scale_ptr,
-    # Output: FP32, shape (M, N_HALF)
-    c_ptr,
+def _fused_gemm1_swiglu_kernel(
+    a_ptr,           # (M, K) FP8
+    a_scale_ptr,     # (K//128, M_stride_dim) FP32
+    w_ptr,           # (2*N_HALF, K) FP8
+    w_scale_ptr,     # (2*N_HALF//128, K//128) FP32
+    c_ptr,           # (M, N_HALF) FP32 output ← MUST be FP32
     M, N_HALF, K,
-    # Strides
-    sa0, sa1,       # A: (M, K)
-    sas0, sas1,     # A_scale: (K//128, M) — NOTE: h_block is dim0, token is dim1
-    sw0, sw1,       # W: (2*N_HALF, K)
-    sws0, sws1,     # W_scale: (2*N_HALF//128, K//128)
-    sc0, sc1,       # C: (M, N_HALF)
+    sa0, sa1,
+    sas0, sas1,
+    sw0, sw1,
+    sws0, sws1,
+    sc0, sc1,
+    N_HALF_BLOCKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_m = offs_m < M
@@ -98,75 +79,49 @@ def _fused_gemm1_swiglu_bf16_kernel(
     gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # W scale block indices (fixed for this tile since BLOCK_N=128=BLOCK_Q)
-    # Gate rows are offs_n (0:INTER), up rows are offs_n + N_HALF
-    n_scale_gate = pid_n                     # offs_n[0] // 128
-    n_scale_up = pid_n + (N_HALF // 128)     # (offs_n[0] + N_HALF) // 128
+    n_scale_gate = pid_n
+    n_scale_up = pid_n + N_HALF_BLOCKS
 
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
-        k_blk = k_start // BLOCK_K    # BLOCK_K=128=BLOCK_Q, so this is the scale index
+        k_blk = k_start // BLOCK_K
 
-        # ── Load A FP8 → BF16 (LOSSLESS: E4M3 has 4 sig bits, BF16 has 8) ──
+        # A: FP8 → BF16 (lossless: E4M3 4 sig bits → BF16 8 bit container)
         a_tile = tl.load(
             a_ptr + offs_m[:, None] * sa0 + offs_k[None, :] * sa1,
             mask=mask_m[:, None] & mask_k[None, :], other=0.0
-        ).to(tl.bfloat16)  # (BLOCK_M, BLOCK_K)
+        ).to(tl.bfloat16)
 
-        # ── Load W_gate FP8 → BF16 (LOSSLESS) ──
+        # W_gate: coalesced load (k is stride-1)
         w_gate = tl.load(
             w_ptr + offs_n[:, None] * sw0 + offs_k[None, :] * sw1,
             mask=mask_n[:, None] & mask_k[None, :], other=0.0
-        ).to(tl.bfloat16)  # (BLOCK_N, BLOCK_K)
+        ).to(tl.bfloat16)
 
-        # ── Load W_up FP8 → BF16 (LOSSLESS) ──
+        # W_up: coalesced load (rows offset by N_HALF)
         w_up = tl.load(
             w_ptr + (offs_n[:, None] + N_HALF) * sw0 + offs_k[None, :] * sw1,
             mask=mask_n[:, None] & mask_k[None, :], other=0.0
-        ).to(tl.bfloat16)  # (BLOCK_N, BLOCK_K)
+        ).to(tl.bfloat16)
 
-        # ── BF16 tensor core dot: (M,K) @ (K,N) ──
-        # Need (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N)
-        # w is (BLOCK_N, BLOCK_K), so we need its transpose
-        # Use transposed load instead of tl.trans to avoid bad codegen:
-        # Load w in (K, N) layout by swapping index roles
-        # Actually, re-load in transposed order for clean codegen:
+        # BF16 tensor core dot
+        raw_gate = tl.dot(a_tile, tl.trans(w_gate))
+        raw_up = tl.dot(a_tile, tl.trans(w_up))
 
-        w_gate_t = tl.load(
-            w_ptr + offs_k[:, None] * sw1 + offs_n[None, :] * sw0,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0
-        ).to(tl.bfloat16)  # (BLOCK_K, BLOCK_N)
-
-        w_up_t = tl.load(
-            w_ptr + offs_k[:, None] * sw1 + (offs_n[None, :] + N_HALF) * sw0,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0
-        ).to(tl.bfloat16)  # (BLOCK_K, BLOCK_N)
-
-        # BF16 dot: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) → FP32
-        raw_gate = tl.dot(a_tile, w_gate_t)   # (BLOCK_M, BLOCK_N) FP32
-        raw_up = tl.dot(a_tile, w_up_t)       # (BLOCK_M, BLOCK_N) FP32
-
-        # ── Load scales (FP32) ──
-        # A scale: per-token, per-K-block → vector of BLOCK_M
+        # Post-dot FP32 scale application
         a_s = tl.load(
             a_scale_ptr + k_blk * sas0 + offs_m * sas1,
             mask=mask_m, other=1.0
-        ).to(tl.float32)  # (BLOCK_M,)
+        ).to(tl.float32)
 
-        # W scale: per-N-block, per-K-block → scalar (since BLOCK_N=128=BLOCK_Q)
         ws_gate = tl.load(w_scale_ptr + n_scale_gate * sws0 + k_blk * sws1).to(tl.float32)
         ws_up = tl.load(w_scale_ptr + n_scale_up * sws0 + k_blk * sws1).to(tl.float32)
 
-        # ── Apply scales in FP32 (ZERO precision loss) ──
-        # Combined scale: a_s[m] * ws_gate (broadcast over N)
-        combined_gate = a_s[:, None] * ws_gate   # (BLOCK_M, 1) * scalar
-        combined_up = a_s[:, None] * ws_up
+        gate_acc += raw_gate * (a_s[:, None] * ws_gate)
+        up_acc += raw_up * (a_s[:, None] * ws_up)
 
-        gate_acc += raw_gate * combined_gate
-        up_acc += raw_up * combined_up
-
-    # ── SwiGLU epilogue (all FP32) ──
+    # SwiGLU in FP32 → store FP32 (NOT BF16 — that caused numerical errors)
     result = gate_acc * (up_acc * tl.sigmoid(up_acc))
 
     tl.store(
@@ -177,58 +132,72 @@ def _fused_gemm1_swiglu_bf16_kernel(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
-#  GEMM2 kernel: SwiGLU output (FP32) × W2 (FP8 dequanted)                     #
-#                                                                               #
-#  Input C is FP32 from SwiGLU (NOT from FP8), so BF16 trick does NOT apply.    #
-#  K=INTERMEDIATE_SIZE=2048 is small, so TF32 is fine.                          #
-#  We keep the proven Sub-7 approach: dequant W to FP32, FP32 dot.              #
+#  GEMM2 + fused route-weight multiply epilogue                                 #
+#  FP32 input from SwiGLU, TF32 tensor cores, FP32 output                     #
+#  Route-weight applied in-register before store (zero precision impact)        #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
 @triton.jit
-def _gemm2_fp32_kernel(
-    c_ptr, w_ptr, s_ptr, o_ptr,
+def _gemm2_weighted_kernel(
+    c_ptr,           # (M, K) FP32 — SwiGLU output
+    w_ptr,           # (N, K) FP8
+    s_ptr,           # (N//128, K//128) FP32
+    route_w_ptr,     # (M,) FP32 — routing weights
+    o_ptr,           # (M, N) FP32 output
     M, N, K,
-    sc0, sc1, sw0, sw1, ss0, ss1, so0, so1,
+    sc0, sc1,
+    sw0, sw1,
+    ss0, ss1,
+    so0, so1,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_m = offs_m < M
     mask_n = offs_n < N
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    n_block_idx = offs_n // 128
+    n_block_idx = pid_n
 
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
-        k_block_idx = k_start // 128
+        k_block_idx = k_start // BLOCK_K
 
-        # C (SwiGLU output) is FP32
+        # C tile: FP32 from SwiGLU
         c_tile = tl.load(
             c_ptr + offs_m[:, None] * sc0 + offs_k[None, :] * sc1,
             mask=mask_m[:, None] & mask_k[None, :], other=0.0
-        )  # FP32
+        )
 
-        # W2 FP8 → FP32
+        # W2: coalesced FP8 load → FP32 dequant
         w_tile = tl.load(
             w_ptr + offs_n[:, None] * sw0 + offs_k[None, :] * sw1,
             mask=mask_n[:, None] & mask_k[None, :], other=0.0
         ).to(tl.float32)
 
-        s_tile = tl.load(
-            s_ptr + n_block_idx * ss0 + k_block_idx * ss1,
-            mask=mask_n, other=1.0
-        ).to(tl.float32)
+        s_val = tl.load(s_ptr + n_block_idx * ss0 + k_block_idx * ss1).to(tl.float32)
+        w_dequant = w_tile * s_val
 
-        w_dequant = w_tile * s_tile[:, None]  # FP32
-        acc += tl.dot(c_tile, tl.trans(w_dequant))  # TF32 tensor cores
+        # TF32 dot with tl.trans (proven on B200)
+        acc += tl.dot(c_tile, tl.trans(w_dequant))
+
+    # Fused epilogue: multiply by routing weight in-register
+    # This is a pure FP32 multiply — zero precision impact
+    # Saves one full (Tk × 7168 × 4 bytes) read-modify-write pass
+    route_w = tl.load(
+        route_w_ptr + offs_m, mask=mask_m, other=0.0
+    ).to(tl.float32)
+    acc = acc * route_w[:, None]
 
     tl.store(
         o_ptr + offs_m[:, None] * so0 + offs_n[None, :] * so1,
-        acc, mask=mask_m[:, None] & mask_n[None, :]
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :]
     )
 
 
@@ -236,7 +205,7 @@ def _gemm2_fp32_kernel(
 def _launch_fused_gemm1_swiglu(a_fp8, a_scale, w_fp8, w_scale, Tk, c_out):
     BM, BN, BK = 64, 128, 128
     grid = (triton.cdiv(Tk, BM), triton.cdiv(INTERMEDIATE_SIZE, BN))
-    _fused_gemm1_swiglu_bf16_kernel[grid](
+    _fused_gemm1_swiglu_kernel[grid](
         a_fp8, a_scale, w_fp8, w_scale, c_out,
         Tk, INTERMEDIATE_SIZE, HIDDEN_SIZE,
         a_fp8.stride(0), a_fp8.stride(1),
@@ -244,23 +213,24 @@ def _launch_fused_gemm1_swiglu(a_fp8, a_scale, w_fp8, w_scale, Tk, c_out):
         w_fp8.stride(0), w_fp8.stride(1),
         w_scale.stride(0), w_scale.stride(1),
         c_out.stride(0), c_out.stride(1),
+        N_HALF_BLOCKS=INTERMEDIATE_SIZE // 128,
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
         num_stages=3, num_warps=4,
     )
 
 
-def _launch_gemm2(c_e, w_fp8, w_scale, Tk, o_out):
+def _launch_gemm2_weighted(c_e, w_fp8, w_scale, route_w, Tk, o_out):
     BM, BN, BK = 64, 128, 128
     grid = (triton.cdiv(Tk, BM), triton.cdiv(HIDDEN_SIZE, BN))
-    _gemm2_fp32_kernel[grid](
-        c_e, w_fp8, w_scale, o_out,
+    _gemm2_weighted_kernel[grid](
+        c_e, w_fp8, w_scale, route_w, o_out,
         Tk, HIDDEN_SIZE, INTERMEDIATE_SIZE,
         c_e.stride(0), c_e.stride(1),
         w_fp8.stride(0), w_fp8.stride(1),
         w_scale.stride(0), w_scale.stride(1),
         o_out.stride(0), o_out.stride(1),
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
-        num_stages=3, num_warps=4,
+        num_stages=4, num_warps=4,
     )
 
 
@@ -279,12 +249,10 @@ def _swiglu_torch(g1):
 
 
 def _dequant_hidden_fp32(hidden_states, hidden_states_scale):
-    """Full FP32 dequant for cuBLAS fallback path only."""
     t_size, h_size = hidden_states.shape
     nb_h = h_size // BLOCK_Q
     x = hidden_states.to(torch.float32).view(t_size, nb_h, BLOCK_Q)
-    # Scale shape: (nb_h, t_size) → need (t_size, nb_h, 1)
-    s = hidden_states_scale.to(torch.float32).t().unsqueeze(2)  # (t_size, nb_h, 1)
+    s = hidden_states_scale.to(torch.float32).t().unsqueeze(2)
     return (x * s).reshape(t_size, h_size)
 
 
@@ -293,8 +261,8 @@ def _dequant_hidden_fp32(hidden_states, hidden_states_scale):
 def kernel(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
-    hidden_states: torch.Tensor,       # (T, 7168) FP8
-    hidden_states_scale: torch.Tensor,  # (56, T) FP32 — h_block × token
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
     gemm2_weights: torch.Tensor,
@@ -310,7 +278,9 @@ def kernel(
     hidden_states = hidden_states.contiguous()
     hidden_states_scale = hidden_states_scale.contiguous()
 
-    # ── Stage 1: Routing (fully vectorized, no change) ─────────────────── #
+    # ══════════════════════════════════════════════════════════════════════ #
+    #  ROUTING                                                              #
+    # ══════════════════════════════════════════════════════════════════════ #
     logits = routing_logits.to(torch.float32)
     bias = routing_bias.to(torch.float32).view(-1)
 
@@ -338,7 +308,9 @@ def kernel(
     topk_w = topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20)
     topk_w = topk_w * float(routed_scaling_factor)
 
-    # ── Stage 2: Build sorted-by-expert token layout ───────────────────── #
+    # ══════════════════════════════════════════════════════════════════════ #
+    #  DISPATCH                                                             #
+    # ══════════════════════════════════════════════════════════════════════ #
     local_idx = topk_idx - local_start
     valid_local = (local_idx >= 0) & (local_idx < NUM_LOCAL_EXPERTS)
 
@@ -363,28 +335,27 @@ def kernel(
     )
     boundaries = torch.cumsum(counts, dim=0)
 
-    # ── Stage 3: Bulk gather ───────────────────────────────────────────── #
-    # FP8 gather: 1 byte/elem (vs 4 bytes for FP32) → 4× less bandwidth
+    # ══════════════════════════════════════════════════════════════════════ #
+    #  BULK GATHER                                                          #
+    # ══════════════════════════════════════════════════════════════════════ #
     N_valid = sorted_token_idx.numel()
     use_bulk = (N_valid >= 64)
 
     if use_bulk:
-        # Gather FP8 hidden states (4× cheaper than FP32)
         sorted_a_fp8 = hidden_states.index_select(0, sorted_token_idx)
-        # Gather scales: hidden_states_scale is (num_h_blocks, T)
-        # We need columns corresponding to sorted_token_idx
         sorted_a_scale = hidden_states_scale.index_select(1, sorted_token_idx)
         sorted_w = topk_w[sorted_token_idx, sorted_topk_pos].to(torch.float32)
 
-    # For cuBLAS fallback, we need FP32 dequanted hidden states (lazy)
     a_fp32_cache = None
 
-    # Pre-allocate scratch buffers
+    # Pre-allocate scratch — ALL FP32
     max_tk = int(counts.max().item())
     c_buf = torch.empty((max_tk, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
     o_buf = torch.empty((max_tk, HIDDEN_SIZE), device=device, dtype=torch.float32)
 
-    # ── Stage 4: Per-expert compute ────────────────────────────────────── #
+    # ══════════════════════════════════════════════════════════════════════ #
+    #  PER-EXPERT COMPUTE                                                   #
+    # ══════════════════════════════════════════════════════════════════════ #
     start = 0
     for i in range(unique_experts.numel()):
         le = unique_experts[i].item()
@@ -393,23 +364,17 @@ def kernel(
 
         t_idx = sorted_token_idx[start:end]
 
-        if use_bulk:
-            w_e = sorted_w[start:end]
-        else:
-            w_e = topk_w[t_idx, sorted_topk_pos[start:end]].to(torch.float32)
-
         if Tk >= FUSED_GEMM_THRESHOLD:
-            # ── Triton path: BF16 tensor cores with factored scales ──
-
-            # Get FP8 tokens and their scales for this expert
             if use_bulk:
-                a_e_fp8 = sorted_a_fp8[start:end]         # (Tk, 7168) FP8 contiguous
-                a_e_scale = sorted_a_scale[:, start:end]   # (56, Tk) FP32
+                a_e_fp8 = sorted_a_fp8[start:end]
+                a_e_scale = sorted_a_scale[:, start:end]
+                w_e = sorted_w[start:end]
             else:
                 a_e_fp8 = hidden_states.index_select(0, t_idx)
                 a_e_scale = hidden_states_scale.index_select(1, t_idx)
+                w_e = topk_w[t_idx, sorted_topk_pos[start:end]].to(torch.float32)
 
-            # Fused GEMM1 + SwiGLU (BF16 tensor cores)
+            # Fused GEMM1+SwiGLU → FP32
             c_view = c_buf[:Tk]
             _launch_fused_gemm1_swiglu(
                 a_e_fp8, a_e_scale,
@@ -417,19 +382,22 @@ def kernel(
                 Tk, c_view
             )
 
-            # GEMM2 (SwiGLU output is FP32, so use FP32/TF32 path)
+            # GEMM2 with fused route-weight → FP32
             o_view = o_buf[:Tk]
-            _launch_gemm2(
+            _launch_gemm2_weighted(
                 c_view, gemm2_weights[le], gemm2_weights_scale[le],
-                Tk, o_view
+                w_e, Tk, o_view
             )
+
+            # Route-weight already applied in GEMM2 epilogue
+            accum.index_add_(0, t_idx, o_view)
+
         else:
-            # ── cuBLAS fallback for tiny experts ──
-            # Dequant hidden states to FP32 (only on first use)
             if a_fp32_cache is None:
                 a_fp32_cache = _dequant_hidden_fp32(hidden_states, hidden_states_scale)
 
             a_e = a_fp32_cache.index_select(0, t_idx)
+            w_e = topk_w[t_idx, sorted_topk_pos[start:end]].to(torch.float32)
 
             w13_e = _dequant_weight(gemm1_weights[le], gemm1_weights_scale[le],
                                     2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)
@@ -438,12 +406,10 @@ def kernel(
 
             w2_e = _dequant_weight(gemm2_weights[le], gemm2_weights_scale[le],
                                    HIDDEN_SIZE, INTERMEDIATE_SIZE)
-            o_view = torch.matmul(c_result, w2_e.t())
+            o_result = torch.matmul(c_result, w2_e.t())
 
-        # ── Weighted scatter-add ──
-        accum.index_add_(0, t_idx, o_view * w_e.unsqueeze(1))
+            accum.index_add_(0, t_idx, o_result * w_e.unsqueeze(1))
 
         start = end
 
-    # ── Write BF16 ─────────────────────────────────────────────────────── #
     output.copy_(accum.to(torch.bfloat16))
