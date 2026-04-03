@@ -33,21 +33,12 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
-# Image with CUDA toolkit for torch-binding CUDA solutions.
-# Starter-kit default only has: debian_slim + pip_install(flashinfer-bench, torch, triton, numpy)
-# We add: build-essential, ninja, nvcc (cuda-nvcc-12-8) for JIT-compiling .cu files.
+# Image for B200 benchmarks.
+# Don't pin old CUDA versions — pip-installed torch brings the correct runtime.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("build-essential", "ninja-build", "wget", "gnupg")
-    .run_commands(
-        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb",
-        "dpkg -i cuda-keyring_1.1-1_all.deb",
-        "apt-get update",
-        "apt-get install -y cuda-nvcc-12-8 cuda-cudart-dev-12-8",
-        "ln -sf /usr/local/cuda-12.8 /usr/local/cuda",
-    )
-    .env({"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:$PATH"})
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "ninja")
+    .apt_install("build-essential", "ninja-build")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "ninja","nvidia-cutlass-dsl")
 )
 
 
