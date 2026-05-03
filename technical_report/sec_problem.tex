@@ -1,0 +1,26 @@
+\section{Problem Statement}
+\label{sec:problem}
+
+\paragraph{Task.}
+The benchmark evaluates a Python-callable \texttt{kernel(\ldots)} implementing one forward pass of a fused MoE FFN, assessed on 19 workloads ($T\!\in\!\{1,7,14\text{--}16,32,52\text{--}62,80,901,11948,14107\}$) for correctness and wall-clock time on an NVIDIA B200.
+
+\paragraph{Architecture.}
+Hidden size $H{=}7168$, intermediate $I{=}2048$; 256 total / 32 local experts; each token selects \textbf{Top-8} experts via hierarchical routing (8 groups of 32 experts, keep top-4 groups by sum-of-top-2 score, then global top-8 from the survivors).
+All weights use FP8 E4M3 block-scale quantization: every $128\!\times\!128$ tile shares one FP32 scalar, so $W_1 \in \mathbb{R}^{32 \times 4096 \times 7168}$ has a $(32, 32, 56)$ scale tensor and $W_2 \in \mathbb{R}^{32\times7168\times2048}$ has a $(32,56,16)$ scale tensor.
+Inputs are FP8; output is BF16.
+
+\paragraph{Computation.}
+$\text{out}[t]=\sum_{k=1}^{8}w_k\cdot W_{2,e_k}^\top\cdot\text{SwiGLU}(W_{1,e_k}^\top x[t])$,
+where $w_k = \sigma(\text{logit}_{e_k}) / \sum_j \sigma(\text{logit}_{e_j}) \times \alpha$ and SwiGLU$(a,b) = a \odot \sigma(b) \cdot b$.
+
+\paragraph{Hardware.}
+B200 (SM100, Blackwell): 148 SMs, 4.5~PFLOPS FP8, 2.25~PFLOPS BF16, 180~TFLOPS TF32, 8~TB/s HBM3e, 228~KB shared memory per SM.
+Per-expert weight footprint: $W_1$~FP8 = 28~MB, $W_2$~FP8 = 14~MB (${\approx}42$~MB/expert, ${\approx}1.3$~GB for all 32 locals).
+
+\paragraph{Theoretical roofline.}
+Our analysis (see \texttt{notes/reference~moe/theoretical\_timing\_analysis.md} in the repository) shows:
+\emph{small-T} ($T\le16$) is launch-overhead-bound (fixed cost ${\approx}$0.35--0.45~ms from ${\sim}13$ PyTorch routing ops + dispatch);
+\emph{medium-T} ($T{=}32$--$80$) is GEMM-compute-bound on weight reads;
+\emph{large-T} ($T\ge900$) is memory-bandwidth-bound on the $42$~MB/expert weight stream.
+This analysis directly motivated each optimization stage
+(see \texttt{notes/reference~moe/} in the repository).

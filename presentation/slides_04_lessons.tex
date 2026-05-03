@@ -1,0 +1,182 @@
+%% slides_04_lessons.tex — Lessons learned and future work
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Lessons \& Future Work}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{What Worked}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{exampleblock}{Kernel Design Wins}
+\small
+\begin{itemize}
+  \item \textbf{GEMM1+SwiGLU fusion:}\\
+    Eliminates 8.4 MB HBM round-trip per expert, saves 1 launch
+  \item \textbf{Lossless FP8$\to$BF16 cast:}\\
+    All 4 sig-bits preserved; unlocks BF16 tensor cores
+  \item \textbf{Post-dot scale factoring:}\\
+    Full FP32 scale precision with BF16-speed dot
+  \item \textbf{FP8 bulk gather:}\\
+    $4\times$ less gather bandwidth (1 byte vs 4 bytes/elem)
+  \item \textbf{Route-weight in epilogue:}\\
+    Free register multiply, eliminates GEMM2 output re-read
+\end{itemize}
+\end{exampleblock}
+
+\column{0.48\textwidth}
+\begin{block}{System-Level Wins}
+\small
+\begin{itemize}
+  \item \textbf{4-launch dispatch table} (vs 96):\\
+    Single biggest win for small-T; was 60\% of runtime
+  \item \textbf{Pre-allocated output (DPS):}\\
+    Avoids extra allocation \& copy per call
+  \item \textbf{Threshold-based fallback:}\\
+    cuBLAS for $T_k < 32$ (better accuracy + low overhead)
+  \item \textbf{Contiguous FP8 gather buffer:}\\
+    Coalesced HBM access, avoids strided SMEM indexing
+\end{itemize}
+\end{block}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{What Didn't Work}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{alertblock}{Failed Experiments}
+\small
+\begin{itemize}
+  \item \textbf{Sub-8: BF16 SwiGLU output}\\[2pt]
+    SwiGLU has full FP32 dynamic range. Truncating to BF16
+    $\to$ 0.13\% error per element over 2048 GEMM2 accumulation
+    steps exceeded tolerance. \textbf{18/19 failed.}
+
+  \medskip
+  \item \textbf{FP32 A-tiles with 4 pipeline stages}\\[2pt]
+    $32\times128\times4 \text{ bytes} \times 4 = 64\text{ KB/stage}$,
+    $\times4 = 256\text{ KB}$, plus compiler overhead exceeds
+    228 KB SMEM limit. OOM at kernel launch.
+
+  \medskip
+  \item \textbf{Transposed weight loads}\\[2pt]
+    Strided HBM access: $32\times$ cache-line amplification.
+    Kernel slows down due to partial cache line reads.
+\end{itemize}
+\end{alertblock}
+
+\column{0.48\textwidth}
+\begin{block}{Key Takeaways}
+\small
+\begin{itemize}
+  \item \textbf{BF16 safe only for FP8-origin data.}\\
+    Any FP32-computed value loses precision when cast.
+
+  \medskip
+  \item \textbf{Dispatch overhead dominates small-T.}\\
+    96 launches $\approx 300\,\mu$s; can be 60\% of total time.
+
+  \medskip
+  \item \textbf{Factor scales out of the dot product.}\\
+    Apply $S_a \times S_w$ in FP32 after the dot; don't pre-dequant.
+
+  \medskip
+  \item \textbf{Gather in FP8, not FP32.}\\
+    $4\times$ bandwidth saving with zero fidelity loss.
+
+  \medskip
+  \item \textbf{SMEM budget is tight.}\\
+    FP8 A-tiles fit in 120 KB; FP32 A-tiles push to 192 KB+.
+\end{itemize}
+\end{block}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Future Work: Native FP8 Tensor Cores on B200}
+\begin{columns}[T]
+\column{0.55\textwidth}
+\begin{block}{Blackwell tcgen05.umma Instructions}
+\small
+SM100 has native FP8 matrix multiply:
+\begin{itemize}\small
+  \item \texttt{tcgen05.umma} operates directly on FP8 inputs
+  \item Block scales loaded from \textbf{TMEM} (Tensor Memory) alongside data
+  \item No BF16 promotion needed
+  \item Throughput: \textbf{4.5 PFLOPS FP8} vs 2.25 PFLOPS BF16
+  \item Accumulation tile: $[64\times128]$ held in TMEM registers
+\end{itemize}
+\end{block}
+
+\begin{exampleblock}{\small Expected Impact}
+\small
+Current bottleneck: seq=32--80 GEMM-bound.\\
+$2\times$ GEMM throughput $\to$ est.\ 2.5--3$\times$ on medium-T.\\
+Requires CUTLASS 4.4 / CuTe DSL (CUDA 13.1+).
+\end{exampleblock}
+
+\column{0.42\textwidth}
+\begin{block}{\small Persistent Grouped GEMM}
+\small
+Replace Python expert loop with one persistent GPU kernel:
+\begin{itemize}\small
+  \item Tile scheduler assigns expert--token tiles to SMs
+  \item Eliminates 32 kernel launch overheads
+  \item All experts computed in one dispatch
+\end{itemize}
+\end{block}
+
+\begin{block}{\small TMA + Warp Specialization}
+\small
+\begin{itemize}\small
+  \item TMA bulk loads for async weight tile fetch
+  \item Separate DMA / MMA / epilogue warps
+  \item Overlap memory latency with compute
+\end{itemize}
+\end{block}
+
+\begin{alertblock}{\small Gap to Close}
+\scriptsize
+With native FP8 TC + persistent kernel:\\
+estimated \textbf{3--5$\times$ over Sub-9} on\\
+medium/large-T workloads.
+\end{alertblock}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Summary}
+\begin{center}
+\small
+\begin{tabular}{lll>{\centering\arraybackslash}p{2.2cm}}
+\toprule
+\textbf{Sub} & \textbf{Key Change} & \textbf{Peak Speedup} & \textbf{All Pass?} \\
+\midrule
+1 & Baseline Triton, correct routing      & 4.35$\times$ & \textcolor{deepgreen}{\checkmark} \\
+2 & Fused GEMM+dequant, vectorized dispatch & 4.29$\times$ & partial \\
+3 & GEMM1+SwiGLU fusion + 4-launch table  & 6.50$\times$ & \textcolor{deepgreen}{\checkmark} \\
+6 & Route-weight in GEMM2 epilogue        & 6.14$\times$ & \textcolor{deepgreen}{\checkmark} \\
+9 & BF16 TC + lossless FP8 cast + FP8 gather & \textbf{7.43}$\times$ & \textcolor{deepgreen}{\textbf{\checkmark 19/19}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{exampleblock}{\small Sub-9 Architecture in One Line}
+\scriptsize
+FP8 bulk gather $\to$ 4-op dispatch $\to$\\
+\quad GEMM1+SwiGLU (BF16 TC, factored scales)\\
+\quad GEMM2 + route-weight epilogue (TF32 TC)\\
+$\to$ \texttt{index\_add\_} scatter $\to$ BF16 output
+\end{exampleblock}
+\column{0.48\textwidth}
+\begin{block}{\small Remaining Opportunity}
+\scriptsize
+seq 32--80: 1.2--1.5$\times$ (GEMM-bound)\\
+\textbf{Next step:} native FP8 tcgen05 + persistent grouped GEMM\\
+Estimated: 3--5$\times$ improvement over Sub-9 on medium/large-T
+\end{block}
+\end{columns}
+\end{frame}

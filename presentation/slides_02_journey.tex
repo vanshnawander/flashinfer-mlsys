@@ -1,0 +1,327 @@
+%% slides_02_journey.tex — Optimization Journey: Sub-1 through Sub-9
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Optimization Journey}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Timeline Overview}
+\begin{center}
+\begin{tikzpicture}[
+    sub/.style={rectangle,draw,rounded corners=5pt,minimum width=1.9cm,
+                minimum height=1.1cm,font=\tiny\bfseries,align=center},
+    arrow/.style={->,thick,>=Stealth},
+    scale=0.9,transform shape]
+\node[sub,fill=yellow!30] (s1) at (0,0)    {Sub-1\\Baseline\\Triton};
+\node[sub,fill=yellow!40] (s2) at (2.8,0)  {Sub-2\\Fused\\GEMM+dequant};
+\node[sub,fill=green!25]  (s3) at (5.6,0)  {Sub-3\\Dispatch\\Table};
+\node[sub,fill=green!35]  (s6) at (8.4,0)  {Sub-6\\Route-wt\\Epilogue};
+\node[sub,fill=green!55]  (s9) at (11.2,0) {Sub-9\\BF16 TC\\+ FP8 gather};
+\draw[arrow](s1)--(s2); \draw[arrow](s2)--(s3);
+\draw[arrow](s3)--(s6); \draw[arrow](s6)--(s9);
+\node[font=\tiny,gray]          at (0,-0.85)   {avg 1.74$\times$};
+\node[font=\tiny,gray]          at (2.8,-0.85) {avg 1.73$\times$};
+\node[font=\tiny,text=deepgreen] at (5.6,-0.85) {avg \textbf{2.17}$\times$};
+\node[font=\tiny,text=deepgreen] at (8.4,-0.85) {avg 2.0$\times$};
+\node[font=\tiny,text=deepgreen] at (11.2,-0.85){peak \textbf{7.43}$\times$};
+\end{tikzpicture}
+\end{center}
+\medskip
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{block}{\small Skipped / Minor}
+\scriptsize
+Sub-4: autotune tile sizes --- no net gain on B200\\
+Sub-5: cuBLAS TF32 test --- reverted\\
+Sub-7: correctness-only fix (intermediate)\\
+Sub-8: numerical issues --- 18/19 failed
+\end{block}
+\column{0.48\textwidth}
+\begin{exampleblock}{\small Key Win Per Stage}
+\scriptsize
+Sub-1$\to$2: large-T $-40\%$ (fused GEMM, no full weight materialize)\\
+Sub-2$\to$3: small-T $-24\%$ (96 launches $\to$ 4)\\
+Sub-3$\to$6: large-T $+27\%$ (route-weight in GEMM2 epilogue)\\
+Sub-6$\to$9: peak $6.1\to7.4\times$ (BF16 TC + FP8 gather)
+\end{exampleblock}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Sub-1: Baseline --- What It Did and Why It Was Slow}
+\begin{columns}[T]
+\column{0.52\textwidth}
+\small\textbf{Approach:}
+\begin{itemize}\small
+  \item Per-expert loop: 32 Python iterations
+  \item Dequant FP8$\to$FP32 (full weight matrix) before each GEMM
+  \item Separate SwiGLU kernel after GEMM1
+  \item 96 kernel launches for dispatch (3 per expert)
+\end{itemize}
+\medskip
+\textbf{B200 Results (19/19):}
+\scriptsize
+\begin{tabular}{rrl}
+\toprule
+Seq & Time & Speedup \\
+\midrule
+1     & 2.57 ms  & 4.35$\times$ \\
+7     & 4.14 ms  & 2.86$\times$ \\
+32    & 10.45 ms & 1.36$\times$ \\
+901   & 20.56 ms & 1.04$\times$ \\
+14107 & 44.07 ms & 1.03$\times$ \\
+\bottomrule
+\end{tabular}
+
+\column{0.45\textwidth}
+\begin{alertblock}{\small Why Large-T Was Near 1$\times$}
+\scriptsize
+\textbf{Weight materialize cost:}\\
+$32\;\text{experts} \times 112\;\text{MB (W1 FP32)}$\\
+$= 3.6\;\text{GB}$ written to HBM per forward\\
+At $8\;\text{TB/s} = 0.45\;\text{ms}$ minimum\\
+\textit{(just for weight copies!)}
+
+\medskip
+\textbf{Dispatch cost:}\\
+96 launches $\times$ 5--15\,$\mu$s $= \sim\!0.5\;\text{ms}$\\
+Dominates for small-T workloads.
+\end{alertblock}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}[fragile]{Dispatch: 96 Kernel Launches $\to$ 4}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{alertblock}{Sub-1 Approach (96 launches)}
+\scriptsize
+\begin{lstlisting}
+for expert in range(32):
+  mask = (local_idx == expert) & valid  # launch
+  if mask.any():                         # launch
+    t_ids = mask.nonzero()               # launch
+    # 3 launches x 32 experts = 96
+\end{lstlisting}
+Each \texttt{nonzero}/\texttt{any} = 5--15\,$\mu$s.\\
+Total: $\approx 300\,\mu$s wasted \textbf{per call}.
+\end{alertblock}
+
+\column{0.48\textwidth}
+\begin{exampleblock}{Sub-3 Approach (4 launches)}
+\scriptsize
+\begin{lstlisting}
+# 1. all valid pairs in one shot
+all_valid = nonzero(valid_local)     # 1 launch
+# 2. sort by expert id
+order = argsort(expert_ids)          # 1 launch
+# 3. find expert boundaries
+unique_e, counts = \
+  unique_consecutive(sorted_e)       # 1 launch
+# loop with Python index math = free
+\end{lstlisting}
+Result: 10--34\% speedup across ALL workloads.\\
+Small-T gained most (dispatch = 60\% of time).
+\end{exampleblock}
+\end{columns}
+
+\medskip
+\begin{block}{Measured Impact on B200 (Sub-2 $\to$ Sub-3)}
+\centering\small
+\begin{tabular}{rccc}
+\toprule
+Seq Len & Sub-2 Time & Sub-3 Time & Gain \\
+\midrule
+1  & 2.583 ms & \textbf{1.716 ms} & $-33\%$ \\
+7  & 4.172 ms & \textbf{3.172 ms} & $-24\%$ \\
+16 & 6.727 ms & \textbf{5.641 ms} & $-16\%$ \\
+\bottomrule
+\end{tabular}
+\end{block}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Sub-3: GEMM1 + SwiGLU Fusion}
+\begin{columns}[T]
+\column{0.52\textwidth}
+\small\textbf{Two changes combined:}
+\begin{enumerate}\small
+  \item Merged gate+up GEMM and SwiGLU into \textbf{one Triton kernel}
+  \item Replaced 96-launch dispatch with 4-launch table
+\end{enumerate}
+
+\medskip\textbf{B200 Results (19/19):}
+\scriptsize\begin{tabular}{rrl}
+\toprule
+Seq & Time & Speedup \\ \midrule
+1     & 1.716 ms  & 6.50$\times$ \\
+7     & 3.172 ms  & 3.73$\times$ \\
+15    & 2.626 ms  & 4.38$\times$ \\
+32    & 9.082 ms  & 1.58$\times$ \\
+14107 & 24.363 ms & 1.85$\times$ \\
+\bottomrule
+\end{tabular}
+
+\column{0.45\textwidth}
+\begin{block}{\small GEMM1+SwiGLU Fusion Benefit}
+\scriptsize
+\textbf{Before:}\\
+GEMM1 writes $[T_k, 4096]$ FP32 to HBM\\
+SwiGLU reads it back\\
+$\Rightarrow T_k \times 4096 \times 8$ bytes round-trip
+
+\medskip
+\textbf{After (fused):}\\
+\texttt{gate\_acc}, \texttt{up\_acc} stay in registers\\
+SwiGLU in epilogue, no store before it\\
+$\Rightarrow$ saves \textbf{8.4 MB/expert} at $T_k=256$\\
+$\Rightarrow$ removes 1 kernel launch per expert
+\end{block}
+
+\begin{exampleblock}{\small A-tile Sharing}
+\scriptsize
+A tile loaded ONCE per K-block.\\
+Used for both gate dot and up dot.\\
+Halves A-read bandwidth in GEMM1.
+\end{exampleblock}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}[fragile]{Sub-6: Route-Weight Fused into GEMM2 Epilogue}
+\begin{columns}[T]
+\column{0.52\textwidth}
+\small\textbf{The idea:}\\
+\smallskip
+Each expert output is multiplied by route weight $w_e$ before scatter-add.
+Previously a separate kernel after GEMM2.
+
+\medskip
+\textbf{Fix:} multiply at store time in GEMM2 --- free in registers:
+\smallskip
+\scriptsize
+\begin{lstlisting}
+# Triton GEMM2 epilogue:
+rw = tl.load(route_w_ptr + offs_m)
+tl.store(o_ptr + ..., acc * rw[:, None])
+\end{lstlisting}
+
+One scalar load per output row. Zero extra HBM traffic.
+
+\column{0.45\textwidth}
+\begin{block}{\small B200 Impact}
+\scriptsize
+\begin{tabular}{rrl}
+\toprule
+Seq & Before & After \\ \midrule
+901   & 10.06 ms & \textbf{8.70 ms} ($+16\%$) \\
+11948 & 17.65 ms & \textbf{14.60 ms} ($+17\%$) \\
+14107 & 24.36 ms & \textbf{19.28 ms} ($+21\%$) \\
+\bottomrule
+\end{tabular}
+\end{block}
+
+\begin{exampleblock}{\small Why Large-T Gains Most}
+\scriptsize
+GEMM2 output: $T_k \times 7168 \times 4\;\text{B}$.\\
+At $T_k=256$: 7.3 MB saved per expert.\\
+$\times 32$ experts $= 234\;\text{MB}$ fewer r/w.
+\end{exampleblock}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Sub-9: Lossless FP8$\to$BF16 Promotion + BF16 Tensor Cores}
+\begin{columns}[T]
+\column{0.5\textwidth}
+\small\textbf{Key insight:}\\
+FP8 E4M3 has \textbf{4 significant bits}.\\
+BF16 has \textbf{7 significant bits}.\\
+$\Rightarrow$ Promoting FP8$\to$BF16 is \textbf{lossless}.
+
+\medskip
+\textbf{Old approach (Sub-3 through Sub-6):}
+\scriptsize
+\begin{enumerate}
+  \item $a_\text{fp8} \times S_a \to$ FP32 (dequant)
+  \item FP32 $\to$ BF16 \textcolor{deepred}{\textbf{[LOSSY: 16 bits of scale lost]}}
+  \item BF16 dot $\to$ FP32 accumulator
+\end{enumerate}
+
+\medskip\small
+\textbf{Sub-9 approach:}
+\scriptsize
+\begin{enumerate}
+  \item $a_\text{fp8} \to$ BF16 directly \textcolor{deepgreen}{\textbf{[LOSSLESS]}}
+  \item BF16 $\times$ BF16 dot $\to$ FP32 raw sum
+  \item Apply $S_a \times S_w$ in FP32 \textbf{post-dot}
+\end{enumerate}
+
+\column{0.47\textwidth}
+\begin{exampleblock}{\small Mathematical Equivalence}
+\scriptsize
+Before: $\sum_k \bigl(a_\text{fp8}[k]\!\cdot\!S_a\bigr)_\text{bf16} \cdot w_\text{fp8}[k]$\\[4pt]
+After:\; $S_a \cdot S_w \cdot \sum_k a_\text{fp8}[k] \cdot w_\text{fp8}[k]$
+
+\medskip
+Scale factored \emph{out} of the inner dot.\\
+Inner sum uses raw FP8 bits in BF16 containers.\\
+Scale applied once in full FP32.
+\end{exampleblock}
+
+\begin{block}{\small Also: FP8 Bulk Gather}
+\scriptsize
+Gather tokens \textbf{before} dequant:\\
+FP8: 1 byte/elem vs FP32: 4 bytes/elem\\
+$\Rightarrow 4\times$ less gather bandwidth\\
+Saves 5.4 MB/expert at $T_k=256$.
+\end{block}
+\end{columns}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Sub-9 Results: 19/19 Passed --- Best Submission}
+\begin{columns}[T]
+\column{0.52\textwidth}
+\small\textbf{B200 Results (19/19 Passed):}
+\smallskip
+\scriptsize
+\begin{tabular}{rrl}
+\toprule
+Seq Len & Time (ms) & Speedup \\
+\midrule
+1      & 1.390  & \textbf{7.43}$\times$ \\
+7      & 2.840  & \textbf{3.81}$\times$ \\
+14     & 4.750  & 2.40$\times$ \\
+15     & 2.288  & \textbf{4.69}$\times$ \\
+16     & 5.276  & 2.21$\times$ \\
+32     & 8.703  & 1.48$\times$ \\
+52--62 & 6.9--10.5 & 1.3--1.8$\times$ \\
+80     & 12.076 & 1.23$\times$ \\
+901    & 12.450 & 1.59$\times$ \\
+11948  & 14.886 & 2.32$\times$ \\
+14107  & 18.540 & 2.35$\times$ \\
+\bottomrule
+\end{tabular}
+
+\column{0.45\textwidth}
+\begin{exampleblock}{\small Where Gains Come From}
+\scriptsize
+\textbf{Small-T (seq 1--16):}\\
+BF16 tensor cores: $\sim\!2\times$ TFLOPS vs prior\\
+Launch overhead minimized\\[4pt]
+\textbf{Large-T (seq $>$1000):}\\
+FP8 gather: $4\times$ less gather bandwidth\\
+Route-weight epilogue: $-234\;\text{MB}$ HBM/fwd\\[4pt]
+\textbf{Medium-T (seq 32--80):}\\
+GEMM-bound; weight tile reads dominate.\\
+1.2--1.5$\times$ --- room for native FP8 TC.
+\end{exampleblock}
+
+\begin{alertblock}{\small Remaining Gap}
+\scriptsize
+Seq 32--80: GEMM-bound.\\
+Native FP8 tensor cores (tcgen05)\\
+would double TFLOPS on this range.
+\end{alertblock}
+\end{columns}
+\end{frame}

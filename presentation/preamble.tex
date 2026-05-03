@@ -1,0 +1,45 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,fit,decorations.pathreplacing}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{multicol}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\usetheme{Madrid}
+\usecolortheme{whale}
+
+\definecolor{deepgreen}{RGB}{0,120,60}
+\definecolor{deepred}{RGB}{180,30,30}
+\definecolor{deepblue}{RGB}{30,60,150}
+\definecolor{codebg}{RGB}{245,245,250}
+\definecolor{accent}{RGB}{220,80,40}
+\definecolor{lightgray}{RGB}{240,240,240}
+\definecolor{mygold}{RGB}{180,140,20}
+
+\setbeamercolor{block title}{bg=deepblue,fg=white}
+\setbeamercolor{block body}{bg=lightgray}
+\setbeamercolor{block title alerted}{bg=deepred,fg=white}
+\setbeamercolor{block body alerted}{bg=lightgray}
+\setbeamercolor{block title example}{bg=deepgreen,fg=white}
+\setbeamercolor{block body example}{bg=lightgray}
+
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\scriptsize,
+    keywordstyle=\color{deepblue}\bfseries,
+    commentstyle=\color{deepgreen}\itshape,
+    stringstyle=\color{accent},
+    backgroundcolor=\color{codebg},
+    frame=single, breaklines=true,
+    showstringspaces=false, tabsize=4,
+}
+
+\title[MoE Kernel Optimization]{\textbf{Optimizing MoE Kernels on B200}}
+\subtitle{FlashInfer Challenge --- DeepSeek-V3/R1 Architecture}
+\author[V. Nawander]{Vansh Nawander --- Humming Bird Team}
+\date{April 2026}

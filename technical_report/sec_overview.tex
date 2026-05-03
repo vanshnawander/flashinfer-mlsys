@@ -1,0 +1,57 @@
+\section{Solution Overview \& AI-Assisted Development}
+\label{sec:overview}
+
+\paragraph{Development methodology.}
+The entire kernel --- routing logic, Triton kernels, dispatch optimization, precision analysis, and NCU-guided tuning --- was developed in an \textbf{agent-assisted workflow}.
+An AI agent iteratively generated candidate kernels, ran them against the FlashInfer-Bench evaluation framework~\cite{flashinfer} on Modal B200 instances, analyzed benchmark outputs and NCU profiles, identified bottlenecks, and proposed the next optimization.
+Human oversight focused on directing search, validating precision rules, and resolving numerical failures.
+The codebase, notes, ideas, and all benchmark logs are available at \url{https://github.com/VanshNawander/accelerated-hpc}.
+
+\paragraph{Architecture.}
+The final kernel implements four stages:
+
+\begin{center}\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}p{3.2cm}p{3.4cm}@{}}
+\toprule
+\textbf{Stage} & \textbf{Implementation} \\
+\midrule
+Routing (sigmoid, topk$\times$2) & PyTorch, vectorized \\
+Dispatch (sort, FP8 gather)       & PyTorch, 4 ops \\
+Expert FFN (GEMM1+SwiGLU, GEMM2) & \textbf{Triton} (BF16/TF32 TC) \\
+Scatter-add                       & \texttt{index\_add\_} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Precision discipline.}
+A key invariant discovered during development:
+\[
+  \underbrace{\mathrm{FP8}}_{\text{load}}
+  \xrightarrow[\text{lossless}]{\text{BF16 cast}}
+  \underbrace{\mathrm{BF16}}_{\cdot}
+  \xrightarrow{\mathrm{tl.dot}}
+  \underbrace{\mathrm{FP32}}_{\text{raw sum}}
+  \xrightarrow{\times S_a S_w}
+  \underbrace{\mathrm{FP32}}_{\text{acc}}
+  \xrightarrow{\text{cast}}
+  \underbrace{\mathrm{BF16}}_{\text{out}}
+\]
+FP8 E4M3 has only 4 significant mantissa bits, fitting losslessly into BF16 (7 bits).
+Consequently, \emph{any FP32-computed value} (SwiGLU activations, accumulated GEMM outputs) must remain FP32 until the final output cast --- violating this rule caused 18/19 correctness failures in one iteration (Section~\ref{sec:failures}).
+
+\paragraph{Optimization milestones.}
+\vspace{1pt}
+
+\noindent\small
+\begin{tabular}{@{}p{1.5cm}p{2.7cm}cc@{}}
+\toprule
+\textbf{Version} & \textbf{Key change} & \textbf{$T$=1} & \textbf{$T$=14k}\\
+\midrule
+Baseline    & Correct routing; cuBLAS; 96 launches & 4.35$\times$ & 1.03$\times$ \\
+Fused GEMM  & On-the-fly tile dequant              & 4.29$\times$ & 1.66$\times$ \\
+Dispatch    & 96$\to$4 launches; GEMM1+SwiGLU fused& 6.50$\times$ & 1.85$\times$ \\
+Route epil. & Route-wt in GEMM2 epilogue           & 6.14$\times$ & 2.35$\times$ \\
+\textbf{Final} & FP8$\to$BF16 TC; FP8 bulk gather & \textbf{7.43$\times$} & \textbf{2.35$\times$} \\
+\bottomrule
+\end{tabular}
+\normalsize

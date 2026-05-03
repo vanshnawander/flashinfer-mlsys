@@ -1,0 +1,77 @@
+\section{Kernel Design \& Optimizations}
+\label{sec:design}
+
+\subsection{O1: Dispatch Table --- 96 Kernel Launches to 4}
+
+The baseline iterated over all 32 experts with \texttt{nonzero}/\texttt{any}/\texttt{nonzero} per expert, producing 96 sequential GPU kernel launches.
+Each PyTorch dispatch call carries ${\approx}$10--30~$\mu$s of overhead; all 96 together cost ${\approx}$300--500~$\mu$s per forward pass --- measured to be 60\% of total runtime at $T{=}1$ (see \texttt{notes/changelog.md}).
+
+\textbf{Fix.} Replace the expert loop with a vectorized dispatch:
+(1)~\texttt{nonzero(valid\_local)} retrieves all (token, topk-slot) pairs in one operation;
+(2)~\texttt{argsort(expert\_ids)} sorts by expert ID;
+(3)~\texttt{unique\_consecutive(\ldots)} computes per-expert boundaries;
+(4)~a plain Python loop slices the sorted arrays (free, no CUDA launch).
+This reduced dispatch from ${\sim}$300~$\mu$s to ${<}$5~$\mu$s, yielding 10--34\% speedup across all workloads (peak: 4.29$\times \to$ 6.50$\times$ at $T{=}1$; large-T gained 10--13\%).
+
+\subsection{O2: Fused GEMM1 + SwiGLU Triton Kernel}
+
+In the baseline, GEMM1 wrote a full $[T_k, 4096]$ FP32 intermediate to HBM before a separate SwiGLU kernel read it back (${\approx}$8.4~MB round-trip at $T_k{=}256$, plus one extra kernel launch per expert).
+
+\textbf{Fix.} A single Triton kernel computes gate and up projections in each K-block,
+sharing one A-tile load (halving hidden-state read bandwidth).
+SwiGLU is applied in-register in the epilogue ($\texttt{result} = \texttt{gate\_acc} \odot \sigma(\texttt{up\_acc}) \cdot \texttt{up\_acc}$), eliminating the HBM store entirely.
+Tile sizes BM=64, BN=BK=128 align with the FP8 quantization block ($q{=}128$), so each tile consumes exactly one scalar weight scale.
+
+\subsection{O3: Lossless FP8$\to$BF16 Promotion and BF16 Tensor Cores}
+
+\textbf{Insight.}
+Earlier iterations dequantized FP8$\to$FP32, then truncated to BF16 before feeding the dot product, losing scale precision.
+Since FP8 E4M3 has only 4 significant bits and BF16 has 7, the promotion FP8$\to$BF16 is \emph{lossless}.
+
+\textbf{Factored post-dot scales.}
+Rather than pre-multiplying block scales before the dot, we factor them out:
+\begin{align*}
+  &S_a \cdot S_w \cdot {\textstyle\sum}_k\, a_\mathrm{fp8}[k] \cdot w_\mathrm{fp8}[k]
+   &&\text{(our method)}\\[-2pt]
+  &\text{vs.}\;{\textstyle\sum}_k (a_\mathrm{fp8}[k]\cdot S_a)_{\mathrm{bf16}} \cdot w_\mathrm{fp8}[k]
+   &&\text{(lossy prior)}
+\end{align*}
+The inner sum uses raw FP8 values in BF16 containers on \emph{BF16 tensor cores} (2.25~PFLOPS on B200, vs.\ 60~TFLOPS on FP32 CUDA cores in prior versions).
+Scales are loaded once per K-block (one scalar per tile) and applied in FP32 after the dot --- mathematically equivalent to full FP32 but ${\approx}2\times$ faster.
+This is inspired by DeepGEMM's~\cite{deepgemm} two-level accumulation approach, where partial sums from tensor cores are periodically promoted to higher-precision FP32 accumulators.
+
+In Triton:
+\begin{lstlisting}
+a_tile = tl.load(a_ptr + ...).to(tl.bfloat16)   # FP8 -> BF16 lossless
+w_gate = tl.load(w_ptr + ...).to(tl.bfloat16)
+raw    = tl.dot(a_tile, tl.trans(w_gate))         # BF16 TC -> FP32 acc
+gate_acc += raw * (a_scale[:, None] * w_scale)    # FP32 post-scale
+\end{lstlisting}
+GEMM1 uses BF16 TCs (\texttt{num\_stages=3, num\_warps=4});
+GEMM2 (FP32 C-tile input from SwiGLU) uses TF32 TCs (\texttt{num\_stages=4, num\_warps=4}).
+
+\subsection{O4: FP8 Bulk Gather --- 4$\times$ Less Bandwidth}
+
+All token-data gathers previously operated on FP32 hidden states (4~bytes/elem), requiring dequantization before gathering.
+Since hidden states are stored in FP8 (1~byte/elem), gathering \emph{before} dequantization reduces gather bandwidth by $4\times$ (${\approx}$5.4~MB saved per expert at $T_k{=}256$; ${\approx}$170~MB across all 32 experts at $T{=}14107$).
+The gathered FP8 buffer is passed directly to the fused GEMM1+SwiGLU kernel, which handles in-tile dequantization.
+
+\subsection{O5: Route-Weight Fused into GEMM2 Epilogue}
+
+Each expert's output must be multiplied by the normalized routing weight $w_e$ before scatter-add.
+The baseline performed this as a separate element-wise multiply, re-reading the full $[T_k, 7168]$ GEMM2 output from HBM (7.3~MB at $T_k{=}256$; 234~MB across 32 experts per forward pass).
+
+\textbf{Fix.} Load the routing weight (one scalar per output row) and apply it in-register at GEMM2 store time:
+\begin{lstlisting}
+rw  = tl.load(route_w_ptr + offs_m).to(tl.float32)
+acc = acc * rw[:, None]       # zero extra HBM traffic
+tl.store(o_ptr + ..., acc, mask=...)
+\end{lstlisting}
+This is a pure in-register FP32 multiply with negligible overhead, saving one full output read-modify-write pass per expert.
+At $T{=}14107$ this eliminated ${\approx}$234~MB of HBM traffic, contributing to the 21\% speedup seen at large-T between the route-epilogue version and the dispatch-only version.
+
+\subsection{Threshold-Based cuBLAS Fallback}
+
+For experts with $T_k{<}32$ tokens, launching Triton kernels costs more than the compute savings (kernel launch ${\approx}$15~$\mu$s; actual compute ${\approx}$3.5~$\mu$s for 28~MB weight read at 8~TB/s).
+These cases fall back to \texttt{torch.matmul} with lazily dequantized FP32 weights (computed at most once per call via \texttt{a\_fp32\_cache}).
+cuBLAS uses TF32 tensor cores (180~TFLOPS) and produces more numerically stable results for small batches where Triton K-loop accumulation order differs from cuBLAS tree reduction.

@@ -1,0 +1,128 @@
+% ============================================================
+%  FlashInfer MLSys 2026 — Fused MoE Technical Report
+%  Vansh Nawander · Manish Shrivastava · LTRC, IIIT Hyderabad
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[top=0.72in,bottom=0.72in,left=0.62in,right=0.62in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage[shortlabels]{enumitem}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{titlesec}
+\usepackage{array}
+
+% ── Compact spacing ──────────────────────────────────────────
+\setlength{\parskip}{1.8pt}
+\setlength{\parindent}{8pt}
+\setlength{\abovecaptionskip}{3pt}
+\setlength{\belowcaptionskip}{1pt}
+\setlength{\textfloatsep}{6pt}
+\setlength{\intextsep}{5pt}
+\setlength{\columnsep}{14pt}
+\titlespacing{\section}{0pt}{6pt}{3pt}
+\titlespacing{\subsection}{0pt}{4pt}{2pt}
+\titlespacing{\paragraph}{0pt}{3pt}{4pt}
+\setlist[itemize]{topsep=1pt,itemsep=1pt,parsep=0pt,leftmargin=1.1em}
+\setlist[enumerate]{topsep=1pt,itemsep=1pt,parsep=0pt,leftmargin=1.2em}
+
+\definecolor{codeblue}{RGB}{25,90,180}
+\definecolor{codegray}{RGB}{100,100,100}
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{codeblue}\bfseries,
+  commentstyle=\color{codegray}\itshape,
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  numbers=none,
+  language=Python,
+  aboveskip=3pt,
+  belowskip=2pt,
+  xleftmargin=3pt,
+  xrightmargin=3pt,
+  framexleftmargin=3pt,
+}
+\captionsetup{font=small,labelfont=bf,skip=3pt}
+
+% ── Custom title block ───────────────────────────────────────
+\makeatletter
+\def\@maketitle{%
+  \newpage\null
+  \begin{center}
+    {\large\bfseries\@title\par}
+    \vspace{6pt}
+    {\normalsize\@author\par}
+  \end{center}
+  \vspace{4pt}
+}
+\makeatother
+
+\title{Optimizing a Fused Mixture-of-Experts Kernel\\
+       for NVIDIA Blackwell (B200) GPUs\\[2pt]
+       {\small\normalfont\itshape
+        FlashInfer AI Kernel Generation Contest @ MLSys 2026 ---
+        \texttt{fused\_moe} Track}}
+
+\author{%
+  \begin{tabular}{cc}
+    \textbf{Vansh Nawander} & \textbf{Manish Shrivastava} \\
+    \small LTRC, IIIT Hyderabad & \small LTRC, IIIT Hyderabad \\
+    \small\texttt{vansh.nawander@research.iiit.ac.in} &
+    \small\texttt{m.shrivastava@iiit.ac.in}
+  \end{tabular}\\[3pt]
+  \small\url{https://github.com/vanshnawander/flashinfer-mlsys}
+}
+\date{}
+
+% ============================================================
+\begin{document}
+\maketitle
+\input{sec_abstract}
+\input{sec_problem}
+\input{sec_overview}
+\input{sec_design}
+\input{sec_perf}
+\input{sec_failures}
+
+\small
+\bibliographystyle{plain}
+\begin{thebibliography}{9}\setlength{\itemsep}{1pt}
+
+\bibitem{deepseek}
+DeepSeek-AI.
+\newblock DeepSeek-V3 technical report, 2024.
+\newblock \url{https://arxiv.org/abs/2412.19437}
+
+\bibitem{deepgemm}
+DeepSeek-AI.
+\newblock DeepGEMM: Clean and efficient FP8 GEMM kernels with fine-grained scaling, 2025.
+\newblock \url{https://github.com/deepseek-ai/DeepGEMM}
+
+\bibitem{triton}
+P.~Tillet, H.~T. Kung, and D.~Cox.
+\newblock Triton: An intermediate language and compiler for tiled neural network computations.
+\newblock In \textit{MAPL}, 2019.
+
+\bibitem{flashinfer}
+FlashInfer-AI.
+\newblock FlashInfer-Bench: Evaluation framework for GPU kernels.
+\newblock \url{https://bench.flashinfer.ai}, 2024.
+
+\bibitem{blackwell}
+NVIDIA.
+\newblock NVIDIA Blackwell architecture technical brief, 2024.
+\newblock \url{https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/}
+
+\bibitem{fa4}
+J.~Shah et al.
+\newblock FlashAttention-4: Triton on Blackwell, 2025.
+\newblock \url{https://github.com/Dao-AILab/flash-attention}
+
+\end{thebibliography}
+\end{document}

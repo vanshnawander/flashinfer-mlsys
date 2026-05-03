@@ -42,9 +42,48 @@ image = (
 )
 
 
+def _collect_gpu_stats() -> dict:
+    """Collect GPU hardware stats via nvidia-smi on the Modal runner."""
+    import subprocess
+    stats = {}
+    try:
+        fields = "gpu_name,memory.total,power.draw,power.limit,clocks.sm,clocks.mem,temperature.gpu"
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL
+        ).decode().strip().split(",")
+        stats["gpu_name"]       = out[0].strip()
+        stats["memory_total_mb"] = float(out[1].strip())
+        stats["power_draw_w"]   = float(out[2].strip())
+        stats["power_limit_w"]  = float(out[3].strip())
+        stats["sm_clock_mhz"]   = float(out[4].strip())
+        stats["mem_clock_mhz"]  = float(out[5].strip())
+        stats["temperature_c"]  = float(out[6].strip())
+    except Exception as e:
+        stats["error"] = str(e)
+    return stats
+
+
+def _compute_moe_flops(seq_len: int, top_k: int = 8, num_experts: int = 256,
+                        num_local_experts: int = 32, hidden: int = 7168,
+                        intermediate: int = 2048) -> float:
+    """
+    Compute total FLOPs for one MoE forward pass (GEMM1 + GEMM2).
+
+    Uses standard 2*M*N*K formula for each GEMM.
+    T_active = seq_len * top_k * num_local_experts / num_experts
+    GEMM1: T_active × (2*intermediate) × hidden  → 2 * T * 2I * H
+    GEMM2: T_active × hidden × intermediate      → 2 * T * H * I
+    """
+    t_active = seq_len * top_k * num_local_experts / num_experts
+    gemm1 = 2.0 * t_active * (2 * intermediate) * hidden
+    gemm2 = 2.0 * t_active * hidden * intermediate
+    return gemm1 + gemm2
+
+
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
+    """Run benchmark on Modal B200 and return results + GPU hardware stats."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -73,6 +112,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
 
+    # Collect GPU hardware stats (runs on Modal B200)
+    gpu_stats = _collect_gpu_stats()
+
     for trace in traces:
         if trace.evaluation:
             entry = {
@@ -87,6 +129,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
+
+    # Attach GPU stats to results
+    results["_gpu_stats"] = gpu_stats
 
     return results
 
@@ -111,7 +156,7 @@ def load_workload_parameters(workload_uuid: str, definition_name: str) -> dict:
 
 
 def print_results(results: dict):
-    """Print benchmark results in a formatted way and save to log file."""
+    """Print benchmark results with GPU stats, TFLOPS, and save to log file."""
     # Create logs directory
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(exist_ok=True)
@@ -120,11 +165,26 @@ def print_results(results: dict):
 
     print(f"\nSaving results to: {log_file}")
 
+    # Extract and display GPU stats
+    gpu_stats = results.pop("_gpu_stats", {})
+
     log_lines = [
         "=" * 80,
         f"BENCHMARK RESULTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "=" * 80, "",
     ]
+
+    if gpu_stats and "error" not in gpu_stats:
+        gpu_info = (
+            f"GPU: {gpu_stats.get('gpu_name', 'N/A')} | "
+            f"VRAM: {gpu_stats.get('memory_total_mb', 0):.0f} MB | "
+            f"Power: {gpu_stats.get('power_draw_w', 0):.0f}W / {gpu_stats.get('power_limit_w', 0):.0f}W | "
+            f"SM: {gpu_stats.get('sm_clock_mhz', 0):.0f} MHz | "
+            f"Temp: {gpu_stats.get('temperature_c', 0):.0f}°C"
+        )
+        print(f"\n{gpu_info}")
+        log_lines.append(gpu_info)
+        log_lines.append("")
 
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
@@ -134,17 +194,32 @@ def print_results(results: dict):
         for workload_uuid, result in traces.items():
             wp = load_workload_parameters(workload_uuid, def_name)
             status = result.get("status")
+            seq_len = wp.get('seq_len', 0)
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             log_lines.append(f"Workload UUID: {workload_uuid}")
             log_lines.append(f"  Status: {status}")
             if wp:
-                log_lines.append(f"  Seq Len: {wp.get('seq_len', 'N/A')}")
+                log_lines.append(f"  Seq Len: {seq_len}")
 
             if result.get("latency_ms") is not None:
                 latency = result["latency_ms"]
                 print(f" | {latency:.3f} ms", end="")
                 log_lines.append(f"  Latency: {latency:.3f} ms")
+
+                # Compute TFLOPS if we know seq_len
+                if seq_len:
+                    flops = _compute_moe_flops(seq_len)
+                    tflops = (flops / (latency / 1000.0)) / 1e12
+                    print(f" | {tflops:.2f} TFLOPS", end="")
+                    log_lines.append(f"  TFLOPS: {tflops:.2f}")
+                    log_lines.append(f"  FLOPs/call: {flops/1e9:.1f} GFLOPS")
+
+                    # Power efficiency
+                    power_w = gpu_stats.get("power_draw_w", 0)
+                    if power_w > 0:
+                        tflops_per_w = tflops / power_w
+                        log_lines.append(f"  TFLOPS/W: {tflops_per_w:.4f}")
 
             if result.get("speedup_factor") is not None:
                 speedup = result["speedup_factor"]

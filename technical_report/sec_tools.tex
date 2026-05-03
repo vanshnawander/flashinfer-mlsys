@@ -1,0 +1,65 @@
+\section{Tools \& Languages}
+\label{sec:tools}
+
+\subsection{Triton}
+
+All performance-critical kernels are implemented in OpenAI Triton~\cite{triton}.
+Triton was chosen for several reasons:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{BF16 tensor-core control.}  Triton exposes \texttt{tl.dot}
+        on BF16 tensors with explicit FP32 accumulator output, which is
+        exactly the lossless FP8$\to$BF16 promotion scheme we exploit.
+  \item \textbf{Explicit tiling.}  Block sizes that match the FP8 scale
+        granularity (BLOCK\_K = BLOCK\_N = 128 = BLOCK\_Q) can be set
+        directly, so each tile consumes exactly one scale value.
+  \item \textbf{Fast iteration.}  Triton's JIT compilation and Python
+        interop allowed us to iterate quickly between B200 runs on Modal.
+  \item \textbf{\texttt{tl.trans()} support.}  The compiler handles
+        layout transposition correctly at the PTX level without manual
+        pointer arithmetic.
+\end{itemize}
+
+\subsection{PyTorch}
+
+Routing (sigmoid, grouped topk), dispatch table construction
+(\texttt{argsort}, \texttt{unique\_consecutive}), and scatter-add
+(\texttt{index\_add\_}) are implemented with PyTorch.  These operations
+are not compute-bound and benefit from PyTorch's well-tuned CUDA primitives.
+The threshold-based cuBLAS fallback ($T_k < 32$) also uses
+\texttt{torch.matmul}, which activates TF32 tensor cores automatically on
+Ampere/Hopper/Blackwell.
+
+\subsection{Modal}
+
+All B200 benchmarks were run via Modal~\cite{flashinfer}, which provides
+on-demand access to B200 GPU instances.  The FlashInfer-Bench evaluation
+framework was used as-is to measure correctness and wall-clock time.
+
+\subsection{NCU Profiling}
+
+NVIDIA Nsight Compute (\texttt{flashinfer\_bench\_run\_ncu}) was used to
+profile kernel-level metrics including achieved occupancy, memory bandwidth
+utilization, and SM efficiency.  Profile data informed decisions such as
+tile size selection (matching SMEM budget) and pipeline depth tuning.
+
+\subsection{Future Directions}
+
+The remaining performance gap at medium sequence lengths ($T = 32$--$80$)
+is GEMM-bound.  Two B200-specific features would close it:
+
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Native FP8 tensor cores (\texttt{tcgen05.umma}).}
+        Blackwell's SM100 supports direct FP8 matrix multiply with block
+        scales loaded from Tensor Memory (TMEM).  Peak throughput is
+        4.5~PFLOPS --- $2\times$ the BF16 rate --- and no BF16 promotion
+        is needed.  Requires CUTLASS 4.4 / CuTe-DSL on CUDA 13.1+.
+  \item \textbf{Persistent grouped GEMM.}
+        Replacing the Python expert loop with a single persistent GPU kernel
+        would eliminate all per-expert kernel launch overhead and enable
+        cross-expert SM-level parallelism.  The tile scheduler would assign
+        expert--token tiles directly to SMs without host synchronization.
+\end{enumerate}
+
+We estimate these two changes could deliver 3--5$\times$ additional speedup
+over the current design on medium-to-large sequence lengths.

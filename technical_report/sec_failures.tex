@@ -1,0 +1,32 @@
+\section{Failed Experiments \& Lessons}
+\label{sec:failures}
+
+\paragraph{BF16 SwiGLU intermediate (18/19 failures).}
+We attempted to store the SwiGLU output in BF16 to halve the GEMM1$\to$GEMM2 transfer.
+SwiGLU values have full FP32 dynamic range: the gate branch can produce values up to $448\!\times\!\text{scale}$, and the per-element BF16 truncation error of ${\approx}$0.13\% compounds over 2048 GEMM2 K-reduction steps to exceed the benchmark tolerance.
+\textbf{Rule derived:} BF16 is safe only for tensors that originate from FP8 (4 sig.\ bits $\le$ BF16's 7); any FP32-computed value must remain FP32 until the final cast.
+
+\paragraph{FP32 A-tiles with 4 pipeline stages (SMEM overflow).}
+With FP32 A-tiles, each stage required $32\!\times\!128\!\times\!4\!=\!16$~KB for A plus $16$~KB for B, so 4 stages $= 128$~KB plus compiler SMEM for accumulators, exceeding the 228~KB B200 limit.
+\textbf{Fix:} FP8 A-tiles (1~byte/elem) reduce per-stage SMEM $4\times$, safely accommodating 3--4 stages.
+
+\paragraph{Transposed weight loads ($2\times$ slowdown).}
+Loading weights by swapping the $(N,K)$ strides to avoid an explicit \texttt{tl.trans()} call produced strided HBM accesses with ${\approx}32\times$ cache-line amplification.
+\textbf{Fix:} coalesced native $(N,K)$ loads + explicit \texttt{tl.trans(w)} before the dot.
+
+\paragraph{triton.autotune (no net gain).}
+We added \texttt{@triton.autotune} with 7 tile configurations.
+The autotune warmup overhead (one full benchmark run per config) dominated the measured time, and the selected config was identical to our hand-tuned BM=64, BN=BK=128.
+We removed autotune and hardcoded the values.
+
+\paragraph{CUDA C++ kernel exploration.}
+An ATen-based CUDA kernel was developed to eliminate Python overhead.
+However, matching the reference's block-scale FP8 dequant exactly proved error-prone (ATen's \texttt{.to(kFloat)} for FP8 applies a different scale layout), resulting in numerical failures on larger workloads.
+The Triton path achieved better accuracy, a faster iteration cycle, and ultimately competitive performance.
+
+\paragraph{Future directions.}
+Three high-impact optimizations remain unexplored within the contest timeframe:
+(1)~\emph{Native FP8 tensor cores} (\texttt{tcgen05.umma}, SM100): direct FP8 MMA with block scales from Tensor Memory at 4.5~PFLOPS --- $2\times$ the current BF16 rate --- estimated to yield 2.5--3$\times$ on medium-T workloads.
+(2)~\emph{Persistent grouped GEMM}: a single GPU kernel processes all experts, eliminating the Python loop and ${\approx}$32 per-expert kernel launches (saves ${\approx}$1.4~ms fixed cost).
+(3)~\emph{Fused Triton routing kernel}: replacing ${\approx}$13 PyTorch routing ops with a single Triton kernel removes the ${\approx}$200~$\mu$s fixed overhead dominating small-T workloads.
+Together, these three are estimated to improve medium/large-T speedup by 3--5$\times$ beyond the current design.

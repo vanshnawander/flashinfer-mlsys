@@ -1,0 +1,57 @@
+\section{Performance Analysis}
+\label{sec:perf}
+
+\begin{table}[H]
+\centering\small\setlength{\tabcolsep}{4pt}
+\caption{Final kernel on B200 (19/19 workloads passed).}
+\label{tab:final}
+\begin{tabular}{rcc|rcc}
+\toprule
+$T$ & Time (ms) & Speedup & $T$ & Time (ms) & Speedup \\
+\midrule
+1   & 1.390 & \textbf{7.43$\times$} & 62   & 7.65  & 1.67$\times$ \\
+7   & 2.840 & 3.81$\times$          & 80   & 12.08 & 1.23$\times$ \\
+15  & 2.288 & 4.69$\times$          & 901  & 12.45 & 1.59$\times$ \\
+16  & 5.276 & 2.21$\times$          & 11948& 14.89 & 2.32$\times$ \\
+32  & 8.703 & 1.48$\times$          & 14107& 18.54 & 2.35$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Small-T ($T\!\le\!16$): launch-overhead bound.}
+Our theoretical roofline analysis predicts a minimum runtime of ${\approx}0.35$~ms for $T{=}1$ (routing ops alone: 13 PyTorch calls $\times$ 15--20~$\mu$s $\approx$ 200~$\mu$s fixed cost).
+The actual gap between theoretical and measured reflects Python interpreter overhead and CUDA driver latency.
+The dispatch table removed ${\approx}$300~$\mu$s pushing $T{=}1$ from 4.29$\times$ to 6.50$\times$; BF16 tensor cores then doubled GEMM1 FLOP rate from ${\sim}$60 TFLOPS to ${\sim}$120 TFLOPS (effective), raising it further to 7.43$\times$.
+The remaining gap to theoretical minimum (${\approx}$2$\times$) requires fusing routing into a single Triton kernel to remove the ${\sim}$200~$\mu$s fixed routing cost.
+
+\paragraph{Medium-T ($32\!\le\!T\!\le\!80$): GEMM-bound.}
+Each expert reads ${\approx}$42~MB of FP8 weights.
+Theoretical GEMM compute for $T_k{=}64$ is ${\approx}$0.063~ms for GEMM1 and 0.031~ms for GEMM2.
+At 32 experts sequentially, this alone is ${\approx}3$~ms; adding kernel launch overhead ($3\times15~\mu$s $\times 32 = 1.4$~ms) yields ${\approx}4.4$~ms theoretical vs.\ our ${\approx}8.7$--$12$~ms actual.
+The ${\approx}2\times$ gap is a known consequence of non-100\% SM occupancy and weight-tile loading stalls.
+Native FP8 tensor cores (\texttt{tcgen05.umma}, 4.5~PFLOPS) would reduce GEMM time by ${\approx}2\times$.
+
+\paragraph{Large-T ($T\!\ge\!900$): bandwidth bound.}
+The memory-bound regime benefits most from our bandwidth optimizations.
+FP8 bulk gather saves $4\times$ on token reads; route-weight epilogue saves 234~MB of output re-reads; fused GEMM avoids materializing 3.6~GB of FP32 weights (vs.\ baseline).
+Together these move the large-T speedup from 1.03$\times$ (baseline) to 2.35$\times$ (final).
+
+\paragraph{Memory traffic budget ($T_k{=}256$, per expert).}
+\begin{center}\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lr|lr}
+\toprule
+Operation & Traffic & Operation & Traffic \\
+\midrule
+FP8 token gather  & 1.8 MB  & $W_2$ FP8 read  & 14 MB \\
+$W_1$ FP8 read    & 28 MB   & GEMM2 C-tiles   & 29 MB \\
+FP32 output write & 7.3 MB  & \textbf{Total}  & $\approx$80 MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+Dominant costs are weight reads and GEMM2 C-tile stream.
+The route-weight epilogue eliminated the 7.3~MB output re-read; FP8 gather saved 5.4~MB vs.\ FP32 gather.
+
+\paragraph{Tools used for profiling.}
+FlashInfer-Bench's \texttt{flashinfer\_bench\_run\_ncu} API was used to collect Nsight Compute profiles.
+Key metrics examined: achieved occupancy (typically 25--50\% for GEMM tiles), memory bandwidth utilization (${\sim}70$\% for large-T), and SM efficiency.
+These guided our tile-size choices (BM=64 vs.\ 128 tradeoff) and pipeline-depth settings.

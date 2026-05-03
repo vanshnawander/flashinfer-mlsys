@@ -1,0 +1,196 @@
+%% slides_03_architecture.tex — Sub-9 final architecture (clear diagram) + speedup chart
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Sub-9 Final Architecture}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Sub-9 Kernel: Full Data Flow}
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={rectangle,draw,rounded corners=4pt,font=\scriptsize,
+              align=center,minimum height=0.65cm},
+  mainbox/.style={rectangle,draw,rounded corners=5pt,font=\small\bfseries,
+                  align=center,minimum height=0.7cm},
+  arr/.style={->,thick,>=Stealth},
+  scale=0.78,transform shape
+]
+
+% ── INPUTS (top row) ──────────────────────────────────────────────────────
+\node[box,fill=blue!12,minimum width=3.2cm]  (hs)  at (0,0)
+    {hidden\_states\\$(T,7168)$ \textbf{FP8}};
+\node[box,fill=blue!12,minimum width=2.5cm]  (hsc) at (4.2,0)
+    {scales\\$(56,T)$ FP32};
+\node[box,fill=purple!12,minimum width=3.4cm](rl)  at (8.5,0)
+    {routing\_logits\\$(T,256)$ FP32};
+\node[box,fill=purple!12,minimum width=2.5cm](rb)  at (12.5,0)
+    {routing\_bias\\$(256,)$ FP32};
+
+% ── STAGE 1: ROUTING ──────────────────────────────────────────────────────
+\node[mainbox,fill=purple!20,minimum width=5cm](rt) at (10.5,-1.8)
+    {Stage 1: Grouped Top-K Routing\\
+     $\sigma \to$ group scores $\to$ top-4 groups $\to$ top-8 experts};
+
+\draw[arr](rl)--(rt); \draw[arr](rb)--(rt);
+
+\node[box,fill=purple!10,minimum width=2.2cm](idx) at (8.2,-3.4)
+    {topk\_idx\\$(T,8)$};
+\node[box,fill=purple!10,minimum width=2.2cm](wts) at (12.8,-3.4)
+    {topk\_w\\$(T,8)$ norm.};
+\draw[arr](rt)--(idx); \draw[arr](rt)--(wts);
+
+% ── STAGE 2: DISPATCH ─────────────────────────────────────────────────────
+\node[mainbox,fill=orange!20,minimum width=7cm](dsp) at (4,-3.4)
+    {Stage 2: FP8 Bulk Gather + Sort by Expert\\
+     \texttt{index\_select} (FP8, 1 byte/elem) $\to$ \texttt{argsort} $\to$ \texttt{unique\_consecutive}};
+
+\draw[arr](hs)|-(-0.5,-2.5)-|(dsp.north);
+\draw[arr](hsc)|-( 2.8,-2.5)-|(dsp.north);
+\draw[arr](idx)--(dsp);
+
+% ── STAGE 3: EXPERT LOOP ──────────────────────────────────────────────────
+\draw[rounded corners=6pt,fill=green!4,draw=deepgreen,thick]
+    (-1.2,-5.0) rectangle (8.8,-10.0);
+\node[font=\small\bfseries,deepgreen] at (3.8,-5.3)
+    {Stage 3: Per-Expert Loop (Python, 32 iterations)};
+
+% GEMM1 box
+\node[mainbox,fill=green!18,minimum width=3.5cm](g1) at (1.5,-6.6)
+    {Fused GEMM1 + SwiGLU};
+\node[font=\tiny,align=center] at (1.5,-7.55)
+    {FP8$\to$BF16 lossless\\BF16 tensor cores\\Factored scales post-dot (FP32)\\
+     A-tile shared for gate + up\\SwiGLU in register epilogue};
+
+% GEMM2 box
+\node[mainbox,fill=green!18,minimum width=3.5cm](g2) at (6.2,-6.6)
+    {GEMM2 + Route-Weight};
+\node[font=\tiny,align=center] at (6.2,-7.55)
+    {C from SwiGLU: FP32\\FP8 W2 + block scales\\TF32 tensor cores\\
+     $w_e$ multiply in store epilogue\\(zero extra memory traffic)};
+
+\draw[arr](dsp.south)-|(1.5,-5.05);
+\draw[arr](g1)--node[above,font=\tiny]{FP32 $[T_k,2048]$}(g2);
+
+% ── STAGE 4: SCATTER ──────────────────────────────────────────────────────
+\node[mainbox,fill=yellow!20,minimum width=6cm](sc) at (3.8,-10.8)
+    {Stage 4: \texttt{index\_add\_} Scatter-Add into accum $(T,7168)$ FP32};
+
+\draw[arr](g2.south)|-(3.8,-10.0)--(sc);
+
+% ── OUTPUT ────────────────────────────────────────────────────────────────
+\node[mainbox,fill=blue!15,minimum width=4cm](out) at (3.8,-12.0)
+    {Output: $(T,7168)$ \textbf{BF16}\\cast from FP32 accum};
+\draw[arr](sc)--(out);
+
+% weight inputs (right side)
+\node[box,fill=orange!10,minimum width=3.0cm](w1) at (13.5,-6.6)
+    {gemm1\_weights\\$(32,4096,7168)$ FP8\\+ scales $(32,32,56)$};
+\node[box,fill=orange!10,minimum width=3.0cm](w2) at (13.5,-8.2)
+    {gemm2\_weights\\$(32,7168,2048)$ FP8\\+ scales $(32,56,16)$};
+\draw[arr,dashed](w1)--(g1);
+\draw[arr,dashed](w2)--(g2);
+
+\end{tikzpicture}
+\end{center}
+\end{frame}
+
+%-----------------------------------------------------------
+\begin{frame}{Sub-9 Architecture: Key Decisions at a Glance}
+\begin{columns}[T]
+\column{0.5\textwidth}
+\begin{exampleblock}{What runs in each stage}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Stage} & \textbf{Where} \\
+\midrule
+Routing (sigmoid, topk) & PyTorch (vectorized) \\
+Dispatch (sort, gather) & PyTorch (4 ops) \\
+GEMM1 + SwiGLU & \textbf{Triton} (BF16 TC) \\
+GEMM2 + route-wt & \textbf{Triton} (TF32 TC) \\
+Scatter-add & PyTorch \texttt{index\_add\_} \\
+\bottomrule
+\end{tabular}
+\end{exampleblock}
+
+\begin{block}{\small Precision Chain}
+\scriptsize
+FP8 tokens $\xrightarrow{\text{lossless}}$ BF16 $\xrightarrow{\text{dot}}$ FP32 raw\\
+$\xrightarrow{\times S_a S_w}$ FP32 accumulator\\
+$\xrightarrow{\text{accum}}$ FP32 output\\
+$\xrightarrow{\text{cast}}$ BF16 final output\\[3pt]
+\textbf{Rule:} BF16 safe only for FP8-origin data.\\
+Any FP32-computed value must stay FP32.
+\end{block}
+
+\column{0.47\textwidth}
+\begin{block}{\small Memory Traffic Per Expert ($T_k=256$)}
+\scriptsize
+\begin{tabular}{lr}
+\toprule
+\textbf{Operation} & \textbf{Traffic} \\
+\midrule
+FP8 gather (1 byte/elem) & 1.8 MB \\
+W1 FP8 read (28 MB) & 28 MB \\
+W2 FP8 read (14 MB) & 14 MB \\
+GEMM1 A-tiles (FP8) & 7.2 MB \\
+GEMM2 C-tiles (FP32) & 29 MB \\
+Output write (FP32) & 7.3 MB \\
+\midrule
+\textbf{Total} & $\sim$87 MB \\
+\bottomrule
+\end{tabular}
+\smallskip
+
+Dominant cost: weight reads + C-tile loads.\\
+FP8 gather saved 5.4 MB vs FP32.\\
+Epilogue fusion saved 7.3 MB output re-read.
+\end{block}
+\end{columns}
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Speedup Progression}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Speedup Across Submissions}
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+    width=10.5cm, height=5.5cm,
+    xlabel={\small Submission},
+    ylabel={\small Speedup vs reference},
+    xtick={1,2,3,6,9},
+    xticklabels={Sub-1,Sub-2,Sub-3,Sub-6,Sub-9},
+    ymin=0.8, ymax=8.5,
+    ymajorgrids=true, grid style=dashed,
+    legend pos=north west,
+    legend style={font=\tiny},
+]
+\addplot[color=deepblue,mark=*,thick] coordinates
+    {(1,4.35)(2,4.29)(3,6.50)(6,6.14)(9,7.43)};
+\addlegendentry{seq=1 (small T)}
+\addplot[color=deepgreen,mark=square*,thick] coordinates
+    {(1,1.36)(2,1.35)(3,1.58)(6,1.54)(9,1.48)};
+\addlegendentry{seq=32 (medium T)}
+\addplot[color=accent,mark=triangle*,thick] coordinates
+    {(1,1.03)(2,1.66)(3,1.85)(6,2.35)(9,2.35)};
+\addlegendentry{seq=14107 (large T)}
+\end{axis}
+\end{tikzpicture}
+\end{center}
+\vspace{-0.3cm}
+\begin{columns}[T]
+\column{0.32\textwidth}
+\begin{block}{\footnotesize Sub-2: large-T jump}
+\scriptsize Fused GEMM: avoids 3.6 GB weight materialize. $1.03\to1.66\times$.
+\end{block}
+\column{0.32\textwidth}
+\begin{block}{\footnotesize Sub-3: small-T jump}
+\scriptsize Dispatch table: $-300\,\mu$s overhead. $4.29\to6.50\times$ at seq=1.
+\end{block}
+\column{0.32\textwidth}
+\begin{block}{\footnotesize Sub-9: small-T jump}
+\scriptsize BF16 TC + FP8 gather. $6.14\to7.43\times$ at seq=1.
+\end{block}
+\end{columns}
+\end{frame}

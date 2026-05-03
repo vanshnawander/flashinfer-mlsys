@@ -1,0 +1,55 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{deepseek}
+\citation{triton}
+\citation{flashinfer}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Problem Statement}{1}{section.1}\protected@file@percent }
+\newlabel{sec:problem}{{1}{1}{Problem Statement}{section.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Task.}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Architecture.}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Computation.}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Hardware.}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Theoretical roofline.}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Solution Overview \& AI-Assisted Development}{1}{section.2}\protected@file@percent }
+\newlabel{sec:overview}{{2}{1}{Solution Overview \& AI-Assisted Development}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Development methodology.}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Architecture.}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Precision discipline.}{1}{section.2}\protected@file@percent }
+\citation{deepgemm}
+\@writefile{toc}{\contentsline {paragraph}{Optimization milestones.}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Kernel Design \& Optimizations}{2}{section.3}\protected@file@percent }
+\newlabel{sec:design}{{3}{2}{Kernel Design \& Optimizations}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}O1: Dispatch Table --- 96 Kernel Launches to 4}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}O2: Fused GEMM1 + SwiGLU Triton Kernel}{2}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}O3: Lossless FP8$\to $BF16 Promotion and BF16 Tensor Cores}{2}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}O4: FP8 Bulk Gather --- 4$\times $ Less Bandwidth}{2}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}O5: Route-Weight Fused into GEMM2 Epilogue}{2}{subsection.3.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Threshold-Based cuBLAS Fallback}{3}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Performance Analysis}{3}{section.4}\protected@file@percent }
+\newlabel{sec:perf}{{4}{3}{Performance Analysis}{section.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Final kernel on B200 (19/19 workloads passed).}}{3}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:final}{{1}{3}{Final kernel on B200 (19/19 workloads passed)}{table.caption.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Small-T ($T\!\le \!16$): launch-overhead bound.}{3}{table.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Medium-T ($32\!\le \!T\!\le \!80$): GEMM-bound.}{3}{table.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Large-T ($T\!\ge \!900$): bandwidth bound.}{3}{table.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Memory traffic budget ($T_k{=}256$, per expert).}{3}{table.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Tools used for profiling.}{3}{table.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Failed Experiments \& Lessons}{3}{section.5}\protected@file@percent }
+\newlabel{sec:failures}{{5}{3}{Failed Experiments \& Lessons}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{BF16 SwiGLU intermediate (18/19 failures).}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{FP32 A-tiles with 4 pipeline stages (SMEM overflow).}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Transposed weight loads ($2\times $ slowdown).}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{triton.autotune (no net gain).}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{CUDA C++ kernel exploration.}{3}{section.5}\protected@file@percent }
+\bibstyle{plain}
+\bibcite{deepseek}{1}
+\bibcite{deepgemm}{2}
+\bibcite{triton}{3}
+\bibcite{flashinfer}{4}
+\bibcite{blackwell}{5}
+\bibcite{fa4}{6}
+\@writefile{toc}{\contentsline {paragraph}{Future directions.}{4}{section.5}\protected@file@percent }
+\gdef \@abspage@last{4}
